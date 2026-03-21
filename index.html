@@ -1,0 +1,603 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Gatekeeper Admission Tester</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=IBM+Plex+Sans:wght@400;500;600&display=swap" rel="stylesheet">
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+    :root {
+      --bg:        #0d0f12;
+      --surface:   #13171e;
+      --border:    #222830;
+      --border-hi: #2e3847;
+      --text:      #c9d1d9;
+      --muted:     #4a5568;
+      --accent:    #38bdf8;
+      --accent-dim:#0c3553;
+      --green:     #22c55e;
+      --green-dim: #052e16;
+      --red:       #f87171;
+      --red-dim:   #2d0a0a;
+      --yellow:    #fbbf24;
+      --mono:      'IBM Plex Mono', monospace;
+      --sans:      'IBM Plex Sans', sans-serif;
+    }
+
+    html, body {
+      height: 100%;
+      background: var(--bg);
+      color: var(--text);
+      font-family: var(--sans);
+      font-size: 14px;
+      line-height: 1.5;
+    }
+
+    /* ── SCANLINE OVERLAY ── */
+    body::before {
+      content: '';
+      position: fixed; inset: 0;
+      background: repeating-linear-gradient(
+        0deg,
+        transparent,
+        transparent 2px,
+        rgba(0,0,0,.07) 2px,
+        rgba(0,0,0,.07) 4px
+      );
+      pointer-events: none;
+      z-index: 9999;
+    }
+
+    /* ── LAYOUT ── */
+    .shell {
+      display: grid;
+      grid-template-rows: auto 1fr;
+      min-height: 100vh;
+      max-width: 1400px;
+      margin: 0 auto;
+      padding: 0 24px;
+    }
+
+    /* ── HEADER ── */
+    header {
+      display: flex;
+      align-items: center;
+      gap: 16px;
+      padding: 20px 0 16px;
+      border-bottom: 1px solid var(--border);
+      margin-bottom: 24px;
+    }
+    .logo-badge {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      background: var(--accent-dim);
+      border: 1px solid var(--accent);
+      border-radius: 4px;
+      padding: 6px 12px;
+    }
+    .logo-badge svg { width: 18px; height: 18px; fill: var(--accent); }
+    .logo-badge span {
+      font-family: var(--mono);
+      font-size: 11px;
+      font-weight: 600;
+      color: var(--accent);
+      letter-spacing: .1em;
+      text-transform: uppercase;
+    }
+    .header-title {
+      display: flex;
+      flex-direction: column;
+    }
+    .header-title h1 {
+      font-family: var(--mono);
+      font-size: 18px;
+      font-weight: 600;
+      color: #e6edf3;
+      letter-spacing: -.01em;
+    }
+    .header-title p {
+      font-size: 12px;
+      color: var(--muted);
+      font-family: var(--mono);
+    }
+    .status-pill {
+      margin-left: auto;
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      font-family: var(--mono);
+      font-size: 11px;
+      color: var(--muted);
+    }
+    .status-pill .dot {
+      width: 6px; height: 6px;
+      border-radius: 50%;
+      background: var(--muted);
+      animation: pulse 2s infinite;
+    }
+    .status-pill.ready .dot { background: var(--green); }
+    @keyframes pulse {
+      0%, 100% { opacity: 1; }
+      50% { opacity: .4; }
+    }
+
+    /* ── MAIN GRID ── */
+    .main {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      grid-template-rows: auto 1fr;
+      gap: 16px;
+      padding-bottom: 24px;
+    }
+
+    /* ── CONFIG BAR ── */
+    .config-bar {
+      grid-column: 1 / -1;
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      padding: 10px 14px;
+    }
+    .config-bar label {
+      font-family: var(--mono);
+      font-size: 11px;
+      color: var(--muted);
+      text-transform: uppercase;
+      letter-spacing: .08em;
+      white-space: nowrap;
+    }
+    .config-bar input {
+      flex: 1;
+      background: var(--bg);
+      border: 1px solid var(--border);
+      border-radius: 4px;
+      color: var(--accent);
+      font-family: var(--mono);
+      font-size: 12px;
+      padding: 6px 10px;
+      outline: none;
+      transition: border-color .15s;
+    }
+    .config-bar input:focus { border-color: var(--accent); }
+    .config-bar input::placeholder { color: var(--muted); }
+
+    .ignore-tls-wrap {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      white-space: nowrap;
+    }
+    .ignore-tls-wrap input[type=checkbox] { accent-color: var(--accent); }
+    .ignore-tls-wrap label { font-family: var(--mono); font-size: 11px; color: var(--muted); cursor: pointer; }
+
+    /* ── PANELS ── */
+    .panel {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      display: flex;
+      flex-direction: column;
+      overflow: hidden;
+    }
+    .panel-header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 10px 14px;
+      border-bottom: 1px solid var(--border);
+      background: rgba(255,255,255,.02);
+    }
+    .panel-label {
+      font-family: var(--mono);
+      font-size: 11px;
+      font-weight: 600;
+      letter-spacing: .1em;
+      text-transform: uppercase;
+      color: var(--muted);
+    }
+    .panel-label .dot-sep { margin: 0 6px; }
+
+    .panel-actions { display: flex; gap: 8px; }
+
+    button {
+      cursor: pointer;
+      font-family: var(--mono);
+      font-size: 11px;
+      border-radius: 4px;
+      border: 1px solid var(--border-hi);
+      background: transparent;
+      color: var(--text);
+      padding: 4px 10px;
+      transition: all .15s;
+    }
+    button:hover { border-color: var(--accent); color: var(--accent); }
+
+    .btn-validate {
+      background: var(--accent);
+      border-color: var(--accent);
+      color: #0d0f12;
+      font-weight: 600;
+      padding: 4px 14px;
+    }
+    .btn-validate:hover { background: #7dd3fc; border-color: #7dd3fc; color: #0d0f12; }
+    .btn-validate:disabled { opacity: .4; cursor: not-allowed; }
+    .btn-validate.loading { position: relative; color: transparent; }
+    .btn-validate.loading::after {
+      content: '';
+      position: absolute; inset: 0;
+      margin: auto;
+      width: 12px; height: 12px;
+      border: 2px solid #0d0f12;
+      border-top-color: transparent;
+      border-radius: 50%;
+      animation: spin .6s linear infinite;
+    }
+    @keyframes spin { to { transform: rotate(360deg); } }
+
+    /* ── EDITOR / TEXTAREA ── */
+    .editor-wrap { flex: 1; position: relative; }
+    .editor {
+      width: 100%;
+      height: 100%;
+      min-height: 380px;
+      background: var(--bg);
+      color: #e6edf3;
+      font-family: var(--mono);
+      font-size: 12.5px;
+      line-height: 1.65;
+      border: none;
+      outline: none;
+      padding: 14px;
+      resize: none;
+      tab-size: 2;
+    }
+    .editor::placeholder { color: var(--muted); }
+
+    /* ── RESPONSE PANEL ── */
+    .response-body {
+      flex: 1;
+      overflow-y: auto;
+      padding: 14px;
+      font-family: var(--mono);
+      font-size: 12.5px;
+      line-height: 1.65;
+    }
+
+    .result-banner {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      border-radius: 5px;
+      padding: 10px 14px;
+      margin-bottom: 14px;
+      font-weight: 600;
+      font-size: 13px;
+      letter-spacing: .02em;
+    }
+    .result-banner.allowed  { background: var(--green-dim); border: 1px solid var(--green);  color: var(--green); }
+    .result-banner.denied   { background: var(--red-dim);   border: 1px solid var(--red);    color: var(--red); }
+    .result-banner.warning  { background: #1a1200;          border: 1px solid var(--yellow); color: var(--yellow); }
+    .result-banner svg { width: 16px; height: 16px; fill: currentColor; flex-shrink: 0; }
+
+    .reason-block {
+      background: var(--bg);
+      border: 1px solid var(--border);
+      border-radius: 4px;
+      padding: 10px 12px;
+      color: var(--text);
+      font-size: 12px;
+      margin-bottom: 14px;
+      white-space: pre-wrap;
+      word-break: break-word;
+    }
+    .reason-block .reason-label {
+      font-size: 10px;
+      text-transform: uppercase;
+      letter-spacing: .1em;
+      color: var(--muted);
+      margin-bottom: 6px;
+    }
+
+    .json-tree { color: #e6edf3; white-space: pre-wrap; word-break: break-word; }
+    .json-key   { color: #79c0ff; }
+    .json-str   { color: #a5d6ff; }
+    .json-num   { color: #ffa657; }
+    .json-bool  { color: var(--yellow); }
+    .json-null  { color: var(--muted); }
+
+    .empty-state {
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      height: 100%;
+      gap: 10px;
+      color: var(--muted);
+      font-size: 12px;
+      text-align: center;
+    }
+    .empty-state svg { width: 32px; height: 32px; opacity: .3; }
+
+    /* scrollbar */
+    ::-webkit-scrollbar { width: 6px; height: 6px; }
+    ::-webkit-scrollbar-track { background: transparent; }
+    ::-webkit-scrollbar-thumb { background: var(--border-hi); border-radius: 3px; }
+
+    /* footer */
+    .footer-bar {
+      grid-column: 1/-1;
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      padding: 0 0 12px;
+      font-family: var(--mono);
+      font-size: 11px;
+      color: var(--muted);
+    }
+
+    @media (max-width: 860px) {
+      .main { grid-template-columns: 1fr; }
+      .config-bar { flex-wrap: wrap; }
+    }
+  </style>
+</head>
+<body>
+<div class="shell">
+
+  <header>
+    <div class="logo-badge">
+      <svg viewBox="0 0 24 24"><path d="M12 2L2 7v10l10 5 10-5V7L12 2zm0 2.18L20 8.5v7L12 19.82 4 15.5v-7L12 4.18z"/></svg>
+      <span>OPA</span>
+    </div>
+    <div class="header-title">
+      <h1>Gatekeeper Admission Tester</h1>
+      <p>validating admission webhook // manifest linter</p>
+    </div>
+    <div class="status-pill" id="statusPill">
+      <span class="dot"></span>
+      <span id="statusText">idle</span>
+    </div>
+  </header>
+
+  <div class="main">
+
+    <!-- CONFIG -->
+    <div class="config-bar">
+      <label>Webhook URL</label>
+      <input type="text" id="gatekeeperUrl"
+        placeholder="https://gatekeeper-webhook.gatekeeper-system.svc:8443/v1/admit"
+        value="" />
+      <div class="ignore-tls-wrap">
+        <input type="checkbox" id="ignoreTls" />
+        <label for="ignoreTls">Skip TLS verify</label>
+      </div>
+    </div>
+
+    <!-- INPUT PANEL -->
+    <div class="panel">
+      <div class="panel-header">
+        <span class="panel-label">manifest <span class="dot-sep">·</span> <span style="color:#79c0ff">JSON</span></span>
+        <div class="panel-actions">
+          <button onclick="loadExample()">load example</button>
+          <button onclick="clearInput()">clear</button>
+          <button class="btn-validate" id="validateBtn" onclick="validate()">▶ validate</button>
+        </div>
+      </div>
+      <div class="editor-wrap">
+        <textarea class="editor" id="manifestInput"
+          placeholder='{
+  "apiVersion": "v1",
+  "kind": "Pod",
+  "metadata": {
+    "name": "my-pod",
+    "namespace": "default"
+  },
+  "spec": {
+    "containers": [
+      {
+        "name": "app",
+        "image": "nginx:latest"
+      }
+    ]
+  }
+}'
+          spellcheck="false"></textarea>
+      </div>
+    </div>
+
+    <!-- OUTPUT PANEL -->
+    <div class="panel">
+      <div class="panel-header">
+        <span class="panel-label">admission response</span>
+        <div class="panel-actions">
+          <button id="copyBtn" onclick="copyResponse()" style="display:none">copy json</button>
+          <button onclick="clearResponse()">clear</button>
+        </div>
+      </div>
+      <div class="response-body" id="responseBody">
+        <div class="empty-state">
+          <svg viewBox="0 0 24 24"><path d="M9 5H7a2 2 0 00-2 2v12a2 2 0 002 2h10a2 2 0 002-2V7a2 2 0 00-2-2h-2M9 5a2 2 0 002 2h2a2 2 0 002-2M9 5a2 2 0 012-2h2a2 2 0 012 2"/></svg>
+          <span>Submit a manifest to see<br>the admission decision here.</span>
+        </div>
+      </div>
+    </div>
+
+    <div class="footer-bar">
+      <span id="footerLeft">ready</span>
+      <span id="footerRight">proxied via /validate</span>
+    </div>
+
+  </div>
+</div>
+
+<script>
+let lastResponse = null;
+
+const EXAMPLE = JSON.stringify({
+  apiVersion: "v1",
+  kind: "Pod",
+  metadata: { name: "example-pod", namespace: "default", labels: { app: "demo" } },
+  spec: {
+    containers: [{
+      name: "web",
+      image: "nginx:latest",
+      ports: [{ containerPort: 80 }],
+      resources: { requests: { cpu: "100m", memory: "128Mi" } }
+    }]
+  }
+}, null, 2);
+
+function loadExample() {
+  document.getElementById("manifestInput").value = EXAMPLE;
+}
+
+function clearInput() {
+  document.getElementById("manifestInput").value = "";
+}
+
+function clearResponse() {
+  lastResponse = null;
+  document.getElementById("copyBtn").style.display = "none";
+  document.getElementById("responseBody").innerHTML = `
+    <div class="empty-state">
+      <svg viewBox="0 0 24 24"><path d="M9 5H7a2 2 0 00-2 2v12a2 2 0 002 2h10a2 2 0 002-2V7a2 2 0 00-2-2h-2M9 5a2 2 0 002 2h2a2 2 0 002-2M9 5a2 2 0 012-2h2a2 2 0 012 2"/></svg>
+      <span>Submit a manifest to see<br>the admission decision here.</span>
+    </div>`;
+}
+
+function setStatus(state, text) {
+  const pill = document.getElementById("statusPill");
+  const span = document.getElementById("statusText");
+  pill.className = "status-pill " + (state === "ready" ? "ready" : "");
+  span.textContent = text;
+}
+
+function colorizeJson(obj) {
+  const str = JSON.stringify(obj, null, 2);
+  return str
+    .replace(/("(\\u[a-zA-Z0-9]{4}|\\[^u]|[^\\"])*"(\s*:)?|\b(true|false|null)\b|-?\d+(?:\.\d*)?(?:[eE][+\-]?\d+)?)/g, (match) => {
+      if (/^"/.test(match)) {
+        if (/:$/.test(match)) return `<span class="json-key">${match}</span>`;
+        return `<span class="json-str">${match}</span>`;
+      } else if (/true|false/.test(match)) return `<span class="json-bool">${match}</span>`;
+      else if (/null/.test(match)) return `<span class="json-null">${match}</span>`;
+      return `<span class="json-num">${match}</span>`;
+    });
+}
+
+async function validate() {
+  const manifest = document.getElementById("manifestInput").value.trim();
+  const gatekeeperUrl = document.getElementById("gatekeeperUrl").value.trim();
+  const ignoreTls = document.getElementById("ignoreTls").checked;
+  const btn = document.getElementById("validateBtn");
+  const body = document.getElementById("responseBody");
+
+  if (!manifest) {
+    body.innerHTML = `<div class="result-banner warning">
+      <svg viewBox="0 0 24 24"><path d="M12 2L1 21h22L12 2zm0 3.5L20.5 19h-17L12 5.5zM11 10v4h2v-4h-2zm0 6v2h2v-2h-2z"/></svg>
+      No manifest provided.
+    </div>`;
+    return;
+  }
+
+  btn.disabled = true;
+  btn.classList.add("loading");
+  setStatus("", "validating...");
+  document.getElementById("footerLeft").textContent = "sending to gatekeeper...";
+
+  try {
+    const res = await fetch("/validate", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ manifest, gatekeeperUrl: gatekeeperUrl || undefined, ignoreTls })
+    });
+
+    const data = await res.json();
+    lastResponse = data;
+    document.getElementById("copyBtn").style.display = "inline-block";
+
+    let banner = "";
+    if (data.error) {
+      banner = `<div class="result-banner warning">
+        <svg viewBox="0 0 24 24"><path d="M12 2L1 21h22L12 2zm0 3.5L20.5 19h-17L12 5.5zM11 10v4h2v-4h-2zm0 6v2h2v-2h-2z"/></svg>
+        Proxy Error: ${escHtml(data.error)}
+      </div>`;
+      setStatus("", "error");
+    } else if (data.allowed === true) {
+      banner = `<div class="result-banner allowed">
+        <svg viewBox="0 0 24 24"><path d="M9 16.2l-4.2-4.2-1.4 1.4L9 19 21 7l-1.4-1.4L9 16.2z"/></svg>
+        ALLOWED — Admission request accepted
+      </div>`;
+      setStatus("ready", "allowed");
+    } else if (data.allowed === false) {
+      banner = `<div class="result-banner denied">
+        <svg viewBox="0 0 24 24"><path d="M19 6.41L17.59 5 12 10.59 6.41 5 5 6.41 10.59 12 5 17.59 6.41 19 12 13.41 17.59 19 19 17.59 13.41 12z"/></svg>
+        DENIED — Admission request rejected
+      </div>`;
+      setStatus("", "denied");
+    } else {
+      banner = `<div class="result-banner warning">
+        <svg viewBox="0 0 24 24"><path d="M12 2L1 21h22L12 2zm0 3.5L20.5 19h-17L12 5.5zM11 10v4h2v-4h-2zm0 6v2h2v-2h-2z"/></svg>
+        Unexpected response format
+      </div>`;
+      setStatus("", "unknown");
+    }
+
+    let reasonHtml = "";
+    if (data.status_message) {
+      reasonHtml = `<div class="reason-block">
+        <div class="reason-label">denial reason</div>
+        ${escHtml(data.status_message)}
+      </div>`;
+    }
+
+    body.innerHTML = banner + reasonHtml + (data.raw
+      ? `<pre class="json-tree">${colorizeJson(data.raw)}</pre>`
+      : "");
+
+    document.getElementById("footerLeft").textContent = `HTTP ${data.status || res.status} · ${new Date().toLocaleTimeString()}`;
+
+  } catch (err) {
+    body.innerHTML = `<div class="result-banner warning">
+      <svg viewBox="0 0 24 24"><path d="M12 2L1 21h22L12 2zm0 3.5L20.5 19h-17L12 5.5zM11 10v4h2v-4h-2zm0 6v2h2v-2h-2z"/></svg>
+      Network error: ${escHtml(err.message)}
+    </div>`;
+    setStatus("", "error");
+    document.getElementById("footerLeft").textContent = "request failed";
+  } finally {
+    btn.disabled = false;
+    btn.classList.remove("loading");
+  }
+}
+
+function copyResponse() {
+  if (lastResponse) {
+    navigator.clipboard.writeText(JSON.stringify(lastResponse, null, 2));
+    const btn = document.getElementById("copyBtn");
+    btn.textContent = "copied!";
+    setTimeout(() => btn.textContent = "copy json", 1500);
+  }
+}
+
+function escHtml(str) {
+  return String(str)
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;");
+}
+
+// keyboard shortcut: Ctrl/Cmd+Enter to validate
+document.addEventListener("keydown", e => {
+  if ((e.ctrlKey || e.metaKey) && e.key === "Enter") validate();
+});
+</script>
+</body>
+</html>

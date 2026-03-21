@@ -1,0 +1,18 @@
+version: "3.9"
+services:
+  gatekeeper-tester:
+    build: .
+    ports:
+      - "3000:3000"
+    environment:
+      # Override default Gatekeeper URL if needed
+      - GATEKEEPER_URL=https://gatekeeper-webhook.gatekeeper-system.svc:8443/v1/admit
+      # Set to "true" to skip TLS verification (useful for self-signed certs in dev)
+      - IGNORE_TLS=false
+      # Optional mTLS — mount certs from host
+      # - TLS_CERT_PATH=/certs/tls.crt
+      # - TLS_KEY_PATH=/certs/tls.key
+      # - TLS_CA_PATH=/certs/ca.crt
+    # volumes:
+    #   - ./certs:/certs:ro
+    restart: unless-stopped
