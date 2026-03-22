@@ -9,26 +9,97 @@ const url   = require("url");
 let yaml;
 try { yaml = require("js-yaml"); } catch { yaml = null; }
 
-// ── Self-signed cert generation via system openssl binary ─────────────────────
+// ── Self-signed cert generation via built-in Node.js crypto ──────────────────
+//
+// Generates an RSA-2048 key pair and a minimal X.509 v3 self-signed certificate
+// with a Subject Alternative Name extension. Uses only Node's built-in `crypto`
+// module — no openssl binary, no npm packages required.
 
 function generateCaptureCert(san) {
-  const { execSync } = require("child_process");
-  const tmpDir   = require("os").tmpdir();
-  const keyFile  = path.join(tmpDir, "gk-capture-key.pem");
-  const certFile = path.join(tmpDir, "gk-capture-cert.pem");
-  // Validate SAN to prevent command injection (hostname-safe chars only)
-  if (!/^[a-zA-Z0-9.\-]+$/.test(san)) throw new Error(`Invalid SAN value: ${san}`);
-  execSync(
-    `openssl req -x509 -newkey rsa:2048 -nodes` +
-    ` -keyout "${keyFile}" -out "${certFile}"` +
-    ` -days 365 -subj "/CN=${san}"` +
-    ` -addext "subjectAltName=DNS:${san},DNS:${san}.cluster.local,IP:127.0.0.1"`,
-    { stdio: "pipe" }
-  );
-  return {
-    private: fs.readFileSync(keyFile, "utf8"),
-    cert:    fs.readFileSync(certFile, "utf8"),
+  const crypto = require("crypto");
+
+  const { privateKey, publicKey } = crypto.generateKeyPairSync("rsa", {
+    modulusLength:      2048,
+    publicKeyEncoding:  { type: "spki",  format: "der" },
+    privateKeyEncoding: { type: "pkcs8", format: "pem" },
+  });
+
+  // ── Minimal ASN.1 / DER encoder ────────────────────────────────────────────
+  const encLen = (n) => {
+    if (n < 0x80) return Buffer.from([n]);
+    const b = [];
+    for (let v = n; v > 0; v >>= 8) b.unshift(v & 0xff);
+    return Buffer.from([0x80 | b.length, ...b]);
   };
+  const tlv  = (tag, val) => Buffer.concat([
+    Buffer.from(Array.isArray(tag) ? tag : [tag]),
+    encLen(val.length),
+    val,
+  ]);
+  const SEQ  = (...a)     => tlv(0x30, Buffer.concat(a));
+  const SET  = (...a)     => tlv(0x31, Buffer.concat(a));
+  const INT  = (b)        => { if (b[0] & 0x80) b = Buffer.concat([Buffer.from([0]), b]); return tlv(0x02, b); };
+  const BITS = (b, u = 0) => tlv(0x03, Buffer.concat([Buffer.from([u]), b]));
+  const OCT  = (b)        => tlv(0x04, b);
+  const BOOL = (v)        => tlv(0x01, Buffer.from([v ? 0xff : 0x00]));
+  const OID  = (d)        => {
+    const p = d.split(".").map(Number);
+    const out = [40 * p[0] + p[1]];
+    for (let i = 2; i < p.length; i++) {
+      let v = p[i]; const c = [v & 0x7f]; v >>= 7;
+      while (v) { c.unshift((v & 0x7f) | 0x80); v >>= 7; }
+      out.push(...c);
+    }
+    return tlv(0x06, Buffer.from(out));
+  };
+  const UTF8  = (s) => tlv(0x0c, Buffer.from(s, "utf8"));
+  const NULL  = ()  => Buffer.from([0x05, 0x00]);
+  const CTX_E = (n, b) => tlv(0xa0 | n, b);  // [n] EXPLICIT
+  const UTC   = (d) => {
+    const z = (n) => String(n).padStart(2, "0");
+    return tlv(0x17, Buffer.from(
+      `${String(d.getUTCFullYear()).slice(2)}${z(d.getUTCMonth()+1)}${z(d.getUTCDate())}` +
+      `${z(d.getUTCHours())}${z(d.getUTCMinutes())}${z(d.getUTCSeconds())}Z`, "ascii"));
+  };
+  const ext = (id, critical, value) =>
+    SEQ(OID(id), ...(critical ? [BOOL(true)] : []), OCT(value));
+
+  // ── Certificate fields ──────────────────────────────────────────────────────
+  const now    = new Date();
+  const expiry = new Date(now.getTime() + 365 * 24 * 3600 * 1000);
+  const serial = crypto.randomBytes(16); serial[0] &= 0x7f;  // ensure positive
+
+  const sigAlg  = SEQ(OID("1.2.840.113549.1.1.11"), NULL()); // sha256WithRSAEncryption
+  const subject = SEQ(SET(SEQ(OID("2.5.4.3"), UTF8(san))));  // CN=san
+
+  // Extensions
+  const sanExt = ext("2.5.29.17", true, SEQ(
+    tlv([0x82], Buffer.from(san, "ascii")),                       // [2] dNSName
+    tlv([0x82], Buffer.from(`${san}.cluster.local`, "ascii")),    // [2] dNSName
+    tlv([0x87], Buffer.from([127, 0, 0, 1])),                     // [7] iPAddress
+  ));
+  // digitalSignature | keyEncipherment = bits 0 and 2 = 0xa0, 5 unused bits
+  const keyUsageExt    = ext("2.5.29.15", true,  BITS(Buffer.from([0xa0]), 5));
+  const extKeyUsageExt = ext("2.5.29.37", false, SEQ(OID("1.3.6.1.5.5.7.3.1"))); // serverAuth
+
+  const tbs = SEQ(
+    CTX_E(0, INT(Buffer.from([0x02]))),                         // version v3
+    INT(serial),                                                 // serialNumber
+    sigAlg,                                                      // signature algorithm
+    subject,                                                     // issuer
+    SEQ(UTC(now), UTC(expiry)),                                  // validity
+    subject,                                                     // subject (= issuer, self-signed)
+    publicKey,                                                   // subjectPublicKeyInfo (DER from Node)
+    CTX_E(3, SEQ(keyUsageExt, extKeyUsageExt, sanExt)),         // extensions
+  );
+
+  const sig  = crypto.sign("sha256", tbs, privateKey);
+  const cert = SEQ(tbs, sigAlg, BITS(sig));
+
+  const toPEM = (label, buf) =>
+    `-----BEGIN ${label}-----\n${buf.toString("base64").match(/.{1,64}/g).join("\n")}\n-----END ${label}-----\n`;
+
+  return { private: privateKey, cert: toPEM("CERTIFICATE", cert) };
 }
 
 // ── Kubernetes in-cluster API helpers ─────────────────────────────────────────
