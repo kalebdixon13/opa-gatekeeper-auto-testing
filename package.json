@@ -7,9 +7,6 @@
     "start": "node server.js"
   },
   "dependencies": {
-    "@kubernetes/client-node": "^0.21.0",
-    "express": "^4.18.2",
-    "js-yaml": "^4.1.0",
-    "selfsigned": "^2.4.1"
+    "js-yaml": "^4.1.0"
   }
 }

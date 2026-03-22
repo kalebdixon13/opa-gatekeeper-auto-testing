@@ -9,11 +9,77 @@ const url   = require("url");
 let yaml;
 try { yaml = require("js-yaml"); } catch { yaml = null; }
 
-let selfsigned;
-try { selfsigned = require("selfsigned"); } catch { selfsigned = null; }
+// ── Self-signed cert generation via system openssl binary ─────────────────────
 
-let k8s;
-try { k8s = require("@kubernetes/client-node"); } catch { k8s = null; }
+function generateCaptureCert(san) {
+  const { execSync } = require("child_process");
+  const tmpDir   = require("os").tmpdir();
+  const keyFile  = path.join(tmpDir, "gk-capture-key.pem");
+  const certFile = path.join(tmpDir, "gk-capture-cert.pem");
+  // Validate SAN to prevent command injection (hostname-safe chars only)
+  if (!/^[a-zA-Z0-9.\-]+$/.test(san)) throw new Error(`Invalid SAN value: ${san}`);
+  execSync(
+    `openssl req -x509 -newkey rsa:2048 -nodes` +
+    ` -keyout "${keyFile}" -out "${certFile}"` +
+    ` -days 365 -subj "/CN=${san}"` +
+    ` -addext "subjectAltName=DNS:${san},DNS:${san}.cluster.local,IP:127.0.0.1"`,
+    { stdio: "pipe" }
+  );
+  return {
+    private: fs.readFileSync(keyFile, "utf8"),
+    cert:    fs.readFileSync(certFile, "utf8"),
+  };
+}
+
+// ── Kubernetes in-cluster API helpers ─────────────────────────────────────────
+
+const K8S_SA   = "/var/run/secrets/kubernetes.io/serviceaccount";
+const VWC_PATH = "/apis/admissionregistration.k8s.io/v1/validatingwebhookconfigurations";
+
+function k8sRequest(method, apiPath, body, contentType = "application/json") {
+  return new Promise((resolve, reject) => {
+    const token   = fs.readFileSync(`${K8S_SA}/token`, "utf8").trim();
+    const ca      = fs.readFileSync(`${K8S_SA}/ca.crt`);
+    const reqBody = body ? JSON.stringify(body) : null;
+    const headers = { "Authorization": `Bearer ${token}` };
+    if (reqBody) {
+      headers["Content-Type"]   = contentType;
+      headers["Content-Length"] = Buffer.byteLength(reqBody);
+    }
+    const req = https.request(
+      { hostname: "kubernetes.default.svc", port: 443, path: apiPath, method, headers, ca },
+      (res) => {
+        let data = "";
+        res.on("data", chunk => data += chunk);
+        res.on("end", () => {
+          try { resolve({ statusCode: res.statusCode, body: JSON.parse(data) }); }
+          catch  { resolve({ statusCode: res.statusCode, body: data }); }
+        });
+      }
+    );
+    req.on("error", reject);
+    if (reqBody) req.write(reqBody);
+    req.end();
+  });
+}
+
+async function applyVWC(vwc) {
+  // Server-side apply — creates or replaces atomically, no resourceVersion needed
+  const res = await k8sRequest(
+    "PATCH",
+    `${VWC_PATH}/${vwc.metadata.name}?fieldManager=gatekeeper-tester&force=true`,
+    vwc,
+    "application/apply-patch+yaml"
+  );
+  if (res.statusCode >= 400)
+    throw new Error(res.body?.message || `k8s API returned ${res.statusCode}`);
+}
+
+async function removeVWC(name) {
+  const res = await k8sRequest("DELETE", `${VWC_PATH}/${name}`);
+  if (res.statusCode >= 400 && res.statusCode !== 404)
+    throw new Error(res.body?.message || `k8s API returned ${res.statusCode}`);
+}
 
 // ── Environment ───────────────────────────────────────────────────────────────
 
@@ -46,28 +112,12 @@ let capturePems   = null;
 let CAPTURE_CA_BUNDLE = null;
 let captureServerStarted = false;
 
-if (selfsigned) {
-  try {
-    capturePems = selfsigned.generate(
-      [{ name: "commonName", value: CAPTURE_SAN }],
-      {
-        days: 365,
-        keySize: 2048,
-        extensions: [{
-          name: "subjectAltName",
-          altNames: [
-            { type: 2, value: CAPTURE_SAN },
-            { type: 2, value: `${CAPTURE_SAN}.cluster.local` },
-            { type: 7, ip: "127.0.0.1" },
-          ],
-        }],
-      }
-    );
-    CAPTURE_CA_BUNDLE = Buffer.from(capturePems.cert).toString("base64");
-    console.log(`Capture cert generated (SAN=${CAPTURE_SAN})`);
-  } catch (e) {
-    console.error("Failed to generate capture cert:", e.message);
-  }
+try {
+  capturePems = generateCaptureCert(CAPTURE_SAN);
+  CAPTURE_CA_BUNDLE = Buffer.from(capturePems.cert).toString("base64");
+  console.log(`Capture cert generated (SAN=${CAPTURE_SAN})`);
+} catch (e) {
+  console.error("Failed to generate capture cert:", e.message);
 }
 
 // ── Capture ring buffer ────────────────────────────────────────────────────────
@@ -128,62 +178,6 @@ if (capturePems) {
     captureServerStarted = true;
     console.log(`Capture webhook listening on :${CAPTURE_PORT} (HTTPS)`);
   });
-}
-
-// ── Kubernetes client helpers ──────────────────────────────────────────────────
-
-function isInCluster() {
-  return fs.existsSync("/var/run/secrets/kubernetes.io/serviceaccount/token");
-}
-
-function getAdmissionClient() {
-  if (!k8s) throw new Error("@kubernetes/client-node is not installed.");
-  const kc = new k8s.KubeConfig();
-  isInCluster() ? kc.loadFromCluster() : kc.loadFromDefault();
-  return kc.makeApiClient(k8s.AdmissionregistrationV1Api);
-}
-
-const VWC_NAME = "gatekeeper-tester-capture";
-
-function buildVWC(config) {
-  const ops       = config.operations?.length ? config.operations : ["CREATE", "UPDATE", "DELETE"];
-  const resources = config.resources?.length  ? config.resources  : ["*"];
-  const nsSelector = config.namespaces?.length
-    ? { matchExpressions: [{ key: "kubernetes.io/metadata.name", operator: "In", values: config.namespaces }] }
-    : undefined;
-
-  return {
-    apiVersion: "admissionregistration.k8s.io/v1",
-    kind: "ValidatingWebhookConfiguration",
-    metadata: {
-      name:   VWC_NAME,
-      labels: { app: "gatekeeper-tester" },
-    },
-    webhooks: [{
-      name:                    "capture.gatekeeper-tester.io",
-      admissionReviewVersions: ["v1"],
-      clientConfig: {
-        service: {
-          name:      SERVICE_NAME,
-          namespace: POD_NAMESPACE,
-          port:      CAPTURE_PORT,
-          path:      "/capture",
-        },
-        caBundle: CAPTURE_CA_BUNDLE,
-      },
-      rules: [{
-        apiGroups:   ["*"],
-        apiVersions: ["*"],
-        operations:  ops,
-        resources,
-        scope: "*",
-      }],
-      ...(nsSelector ? { namespaceSelector: nsSelector } : {}),
-      failurePolicy:  "Ignore",
-      sideEffects:    "None",
-      timeoutSeconds: 5,
-    }],
-  };
 }
 
 // ── Generic helpers ────────────────────────────────────────────────────────────
@@ -424,7 +418,7 @@ async function handleBatch(req, res) {
  */
 async function handleCaptureStart(req, res) {
   if (!capturePems || !captureServerStarted) {
-    return sendJson(res, 503, { error: "Capture HTTPS server is not running (selfsigned package missing or port conflict)." });
+    return sendJson(res, 503, { error: "Capture HTTPS server is not running (openssl cert generation failed or port conflict)." });
   }
   if (!CAPTURE_CA_BUNDLE) {
     return sendJson(res, 503, { error: "TLS cert was not generated. Capture is unavailable." });
@@ -450,22 +444,11 @@ async function handleCaptureStart(req, res) {
   if (typeof config.resources  === "string") config.resources  = config.resources.split(",").map(s => s.trim()).filter(Boolean);
 
   const vwc = buildVWC(config);
-  const client = getAdmissionClient();
 
   try {
-    await client.createValidatingWebhookConfiguration(vwc);
+    await applyVWC(vwc);
   } catch (e) {
-    const statusCode = e.response?.statusCode ?? e.statusCode;
-    if (statusCode === 409) {
-      // VWC already exists — replace it (updates caBundle with freshly generated cert)
-      try {
-        await client.replaceValidatingWebhookConfiguration(VWC_NAME, vwc);
-      } catch (e2) {
-        return sendJson(res, 500, { error: `Failed to replace VWC: ${e2.message}` });
-      }
-    } else {
-      return sendJson(res, 500, { error: `Failed to create VWC: ${e.message}` });
-    }
+    return sendJson(res, 500, { error: `Failed to apply VWC: ${e.message}` });
   }
 
   captureActive = true;
@@ -487,19 +470,14 @@ async function handleCaptureStart(req, res) {
 async function handleCaptureStop(req, res) {
   captureActive = false;
 
-  if (!isInCluster() || !k8s) {
+  if (!isInCluster()) {
     return sendJson(res, 200, { active: false, note: "Not in-cluster — no VWC to delete." });
   }
 
-  const client = getAdmissionClient();
   try {
-    await client.deleteValidatingWebhookConfiguration(VWC_NAME);
+    await removeVWC(VWC_NAME);
   } catch (e) {
-    const statusCode = e.response?.statusCode ?? e.statusCode;
-    if (statusCode !== 404) {
-      return sendJson(res, 500, { error: `Failed to delete VWC: ${e.message}` });
-    }
-    // 404 means it was already gone — that's fine
+    return sendJson(res, 500, { error: `Failed to delete VWC: ${e.message}` });
   }
 
   sendJson(res, 200, { active: false, vwcName: VWC_NAME });
@@ -519,7 +497,6 @@ function handleCaptureStatus(req, res) {
     requestCount:         capturedRequests.length,
     config:               captureConfig,
     inCluster:            isInCluster(),
-    k8sClientAvailable:   !!k8s,
     certAvailable:        !!capturePems,
   });
 }
@@ -541,6 +518,55 @@ function handleGetCaptured(req, res) {
 function handleDeleteCaptured(req, res) {
   capturedRequests = [];
   sendJson(res, 200, { cleared: true });
+}
+
+// ── Kubernetes helpers (non-API) ───────────────────────────────────────────────
+
+function isInCluster() {
+  return fs.existsSync(`${K8S_SA}/token`);
+}
+
+const VWC_NAME = "gatekeeper-tester-capture";
+
+function buildVWC(config) {
+  const ops       = config.operations?.length ? config.operations : ["CREATE", "UPDATE", "DELETE"];
+  const resources = config.resources?.length  ? config.resources  : ["*"];
+  const nsSelector = config.namespaces?.length
+    ? { matchExpressions: [{ key: "kubernetes.io/metadata.name", operator: "In", values: config.namespaces }] }
+    : undefined;
+
+  return {
+    apiVersion: "admissionregistration.k8s.io/v1",
+    kind: "ValidatingWebhookConfiguration",
+    metadata: {
+      name:   VWC_NAME,
+      labels: { app: "gatekeeper-tester" },
+    },
+    webhooks: [{
+      name:                    "capture.gatekeeper-tester.io",
+      admissionReviewVersions: ["v1"],
+      clientConfig: {
+        service: {
+          name:      SERVICE_NAME,
+          namespace: POD_NAMESPACE,
+          port:      CAPTURE_PORT,
+          path:      "/capture",
+        },
+        caBundle: CAPTURE_CA_BUNDLE,
+      },
+      rules: [{
+        apiGroups:   ["*"],
+        apiVersions: ["*"],
+        operations:  ops,
+        resources,
+        scope: "*",
+      }],
+      ...(nsSelector ? { namespaceSelector: nsSelector } : {}),
+      failurePolicy:  "Ignore",
+      sideEffects:    "None",
+      timeoutSeconds: 5,
+    }],
+  };
 }
 
 // ── HTTP server ───────────────────────────────────────────────────────────────

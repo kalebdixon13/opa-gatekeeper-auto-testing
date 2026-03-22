@@ -2,6 +2,9 @@ FROM node:20-alpine
 
 WORKDIR /app
 
+# openssl is used at runtime to generate the capture webhook's self-signed cert
+RUN apk add --no-cache openssl
+
 # Drop root — run as non-root user
 RUN addgroup -S gktester && adduser -S gktester -G gktester
 
