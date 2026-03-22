@@ -153,7 +153,7 @@
       letter-spacing: .08em;
       white-space: nowrap;
     }
-    .config-bar input {
+    .config-bar input[type=text] {
       flex: 1;
       background: var(--bg);
       border: 1px solid var(--border);
@@ -165,8 +165,8 @@
       outline: none;
       transition: border-color .15s;
     }
-    .config-bar input:focus { border-color: var(--accent); }
-    .config-bar input::placeholder { color: var(--muted); }
+    .config-bar input[type=text]:focus { border-color: var(--accent); }
+    .config-bar input[type=text]::placeholder { color: var(--muted); }
 
     .ignore-tls-wrap {
       display: flex;
@@ -190,9 +190,17 @@
       display: flex;
       align-items: center;
       justify-content: space-between;
-      padding: 10px 14px;
+      padding: 8px 14px;
       border-bottom: 1px solid var(--border);
       background: rgba(255,255,255,.02);
+      gap: 10px;
+      flex-wrap: wrap;
+    }
+    .panel-header-left {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      flex-wrap: wrap;
     }
     .panel-label {
       font-family: var(--mono);
@@ -201,10 +209,35 @@
       letter-spacing: .1em;
       text-transform: uppercase;
       color: var(--muted);
+      white-space: nowrap;
     }
-    .panel-label .dot-sep { margin: 0 6px; }
 
-    .panel-actions { display: flex; gap: 8px; }
+    /* ── SEGMENTED TOGGLE ── */
+    .seg-toggle {
+      display: flex;
+      border: 1px solid var(--border-hi);
+      border-radius: 4px;
+      overflow: hidden;
+    }
+    .seg-toggle button {
+      border: none;
+      border-radius: 0;
+      padding: 3px 10px;
+      font-size: 10px;
+      letter-spacing: .06em;
+      text-transform: uppercase;
+      color: var(--muted);
+      background: transparent;
+    }
+    .seg-toggle button:not(:last-child) { border-right: 1px solid var(--border-hi); }
+    .seg-toggle button.active {
+      background: var(--accent-dim);
+      color: var(--accent);
+      border-color: var(--border-hi);
+    }
+    .seg-toggle button:hover:not(.active) { color: var(--text); border-color: var(--border-hi); }
+
+    .panel-actions { display: flex; gap: 8px; flex-shrink: 0; }
 
     button {
       cursor: pointer;
@@ -383,32 +416,30 @@
     <!-- INPUT PANEL -->
     <div class="panel">
       <div class="panel-header">
-        <span class="panel-label">manifest <span class="dot-sep">·</span> <span style="color:#79c0ff">JSON</span></span>
+        <div class="panel-header-left">
+          <span class="panel-label">input</span>
+
+          <!-- Mode toggle: manifest vs full admission request -->
+          <div class="seg-toggle" id="modeToggle">
+            <button class="active" onclick="setMode('manifest')">manifest</button>
+            <button onclick="setMode('full-request')">full request</button>
+          </div>
+
+          <!-- Format toggle: only visible in manifest mode -->
+          <div class="seg-toggle" id="formatToggle">
+            <button class="active" onclick="setFormat('yaml')">yaml</button>
+            <button onclick="setFormat('json')">json</button>
+          </div>
+        </div>
+
         <div class="panel-actions">
-          <button onclick="loadExample()">load example</button>
+          <button onclick="loadExample()">example</button>
           <button onclick="clearInput()">clear</button>
-          <button class="btn-validate" id="validateBtn" onclick="validate()">▶ validate</button>
+          <button class="btn-validate" id="validateBtn" onclick="validate()">&#9654; validate</button>
         </div>
       </div>
       <div class="editor-wrap">
-        <textarea class="editor" id="manifestInput"
-          placeholder='{
-  "apiVersion": "v1",
-  "kind": "Pod",
-  "metadata": {
-    "name": "my-pod",
-    "namespace": "default"
-  },
-  "spec": {
-    "containers": [
-      {
-        "name": "app",
-        "image": "nginx:latest"
-      }
-    ]
-  }
-}'
-          spellcheck="false"></textarea>
+        <textarea class="editor" id="manifestInput" spellcheck="false"></textarea>
       </div>
     </div>
 
@@ -437,10 +468,35 @@
   </div>
 </div>
 
+<!-- js-yaml for client-side YAML → JSON conversion -->
+<script src="https://cdnjs.cloudflare.com/ajax/libs/js-yaml/4.1.0/js-yaml.min.js"></script>
 <script>
+// ── State ──────────────────────────────────────────────────────────────────────
 let lastResponse = null;
+let inputMode   = "manifest";     // "manifest" | "full-request"
+let inputFormat = "yaml";         // "yaml" | "json"  (manifest mode only)
 
-const EXAMPLE = JSON.stringify({
+// ── Examples ───────────────────────────────────────────────────────────────────
+const EXAMPLE_YAML = `apiVersion: v1
+kind: Pod
+metadata:
+  name: example-pod
+  namespace: default
+  labels:
+    app: demo
+spec:
+  containers:
+    - name: web
+      image: nginx:latest
+      ports:
+        - containerPort: 80
+      resources:
+        requests:
+          cpu: "100m"
+          memory: "128Mi"
+`;
+
+const EXAMPLE_JSON = JSON.stringify({
   apiVersion: "v1",
   kind: "Pod",
   metadata: { name: "example-pod", namespace: "default", labels: { app: "demo" } },
@@ -454,8 +510,118 @@ const EXAMPLE = JSON.stringify({
   }
 }, null, 2);
 
+const EXAMPLE_FULL_REQUEST = JSON.stringify({
+  apiVersion: "admission.k8s.io/v1",
+  kind: "AdmissionReview",
+  request: {
+    uid: "test-00000000",
+    kind:     { group: "", version: "v1", kind: "Pod" },
+    resource: { group: "", version: "v1", resource: "pods" },
+    name:      "example-pod",
+    namespace: "default",
+    operation: "CREATE",
+    userInfo: {
+      username: "system:serviceaccount:kube-system:deployment-controller",
+      groups:   ["system:serviceaccounts", "system:authenticated"]
+    },
+    object: {
+      apiVersion: "v1",
+      kind: "Pod",
+      metadata: { name: "example-pod", namespace: "default", labels: { app: "demo" } },
+      spec: {
+        containers: [{
+          name: "web",
+          image: "nginx:latest",
+          ports: [{ containerPort: 80 }],
+          resources: { requests: { cpu: "100m", memory: "128Mi" } }
+        }]
+      }
+    }
+  }
+}, null, 2);
+
+// ── Placeholders ───────────────────────────────────────────────────────────────
+const PLACEHOLDER_YAML = `apiVersion: v1
+kind: Pod
+metadata:
+  name: my-pod
+  namespace: default
+spec:
+  containers:
+    - name: app
+      image: nginx:latest`;
+
+const PLACEHOLDER_JSON = `{
+  "apiVersion": "v1",
+  "kind": "Pod",
+  "metadata": {
+    "name": "my-pod",
+    "namespace": "default"
+  },
+  "spec": {
+    "containers": [
+      { "name": "app", "image": "nginx:latest" }
+    ]
+  }
+}`;
+
+const PLACEHOLDER_FULL_REQUEST = `{
+  "apiVersion": "admission.k8s.io/v1",
+  "kind": "AdmissionReview",
+  "request": {
+    "uid": "test-00000000",
+    "kind": { "group": "", "version": "v1", "kind": "Pod" },
+    "resource": { "group": "", "version": "v1", "resource": "pods" },
+    "name": "my-pod",
+    "namespace": "default",
+    "operation": "CREATE",
+    "userInfo": {
+      "username": "alice",
+      "groups": ["system:authenticated"]
+    },
+    "object": { ... }
+  }
+}`;
+
+// ── UI Helpers ─────────────────────────────────────────────────────────────────
+function setMode(mode) {
+  inputMode = mode;
+  const btns = document.querySelectorAll("#modeToggle button");
+  btns[0].classList.toggle("active", mode === "manifest");
+  btns[1].classList.toggle("active", mode === "full-request");
+  document.getElementById("formatToggle").style.display =
+    mode === "manifest" ? "" : "none";
+  updatePlaceholder();
+}
+
+function setFormat(fmt) {
+  inputFormat = fmt;
+  const btns = document.querySelectorAll("#formatToggle button");
+  btns[0].classList.toggle("active", fmt === "yaml");
+  btns[1].classList.toggle("active", fmt === "json");
+  updatePlaceholder();
+}
+
+function updatePlaceholder() {
+  const ta = document.getElementById("manifestInput");
+  if (inputMode === "full-request") {
+    ta.placeholder = PLACEHOLDER_FULL_REQUEST;
+  } else if (inputFormat === "yaml") {
+    ta.placeholder = PLACEHOLDER_YAML;
+  } else {
+    ta.placeholder = PLACEHOLDER_JSON;
+  }
+}
+
 function loadExample() {
-  document.getElementById("manifestInput").value = EXAMPLE;
+  const ta = document.getElementById("manifestInput");
+  if (inputMode === "full-request") {
+    ta.value = EXAMPLE_FULL_REQUEST;
+  } else if (inputFormat === "yaml") {
+    ta.value = EXAMPLE_YAML;
+  } else {
+    ta.value = EXAMPLE_JSON;
+  }
 }
 
 function clearInput() {
@@ -481,30 +647,74 @@ function setStatus(state, text) {
 
 function colorizeJson(obj) {
   const str = JSON.stringify(obj, null, 2);
-  return str
-    .replace(/("(\\u[a-zA-Z0-9]{4}|\\[^u]|[^\\"])*"(\s*:)?|\b(true|false|null)\b|-?\d+(?:\.\d*)?(?:[eE][+\-]?\d+)?)/g, (match) => {
+  return str.replace(
+    /("(\\u[a-zA-Z0-9]{4}|\\[^u]|[^\\"])*"(\s*:)?|\b(true|false|null)\b|-?\d+(?:\.\d*)?(?:[eE][+\-]?\d+)?)/g,
+    (match) => {
       if (/^"/.test(match)) {
         if (/:$/.test(match)) return `<span class="json-key">${match}</span>`;
         return `<span class="json-str">${match}</span>`;
-      } else if (/true|false/.test(match)) return `<span class="json-bool">${match}</span>`;
-      else if (/null/.test(match)) return `<span class="json-null">${match}</span>`;
+      }
+      if (/true|false/.test(match)) return `<span class="json-bool">${match}</span>`;
+      if (/null/.test(match))       return `<span class="json-null">${match}</span>`;
       return `<span class="json-num">${match}</span>`;
-    });
+    }
+  );
 }
 
-async function validate() {
-  const manifest = document.getElementById("manifestInput").value.trim();
-  const gatekeeperUrl = document.getElementById("gatekeeperUrl").value.trim();
-  const ignoreTls = document.getElementById("ignoreTls").checked;
-  const btn = document.getElementById("validateBtn");
-  const body = document.getElementById("responseBody");
+function escHtml(str) {
+  return String(str)
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;");
+}
 
-  if (!manifest) {
+// ── Main validate action ───────────────────────────────────────────────────────
+async function validate() {
+  const raw          = document.getElementById("manifestInput").value.trim();
+  const gatekeeperUrl = document.getElementById("gatekeeperUrl").value.trim();
+  const ignoreTls    = document.getElementById("ignoreTls").checked;
+  const btn          = document.getElementById("validateBtn");
+  const body         = document.getElementById("responseBody");
+
+  if (!raw) {
     body.innerHTML = `<div class="result-banner warning">
       <svg viewBox="0 0 24 24"><path d="M12 2L1 21h22L12 2zm0 3.5L20.5 19h-17L12 5.5zM11 10v4h2v-4h-2zm0 6v2h2v-2h-2z"/></svg>
-      No manifest provided.
+      No input provided.
     </div>`;
     return;
+  }
+
+  // Build the request payload depending on mode.
+  let payload;
+
+  if (inputMode === "full-request") {
+    // Expect a complete AdmissionReview JSON (or YAML).
+    let parsed;
+    try {
+      parsed = parseInput(raw);
+    } catch (e) {
+      body.innerHTML = `<div class="result-banner warning">
+        <svg viewBox="0 0 24 24"><path d="M12 2L1 21h22L12 2zm0 3.5L20.5 19h-17L12 5.5zM11 10v4h2v-4h-2zm0 6v2h2v-2h-2z"/></svg>
+        Parse error: ${escHtml(e.message)}
+      </div>`;
+      return;
+    }
+    payload = { admissionRequest: parsed, gatekeeperUrl: gatekeeperUrl || undefined, ignoreTls };
+
+  } else {
+    // Manifest mode — parse YAML or JSON, send as manifest object.
+    let parsed;
+    try {
+      parsed = parseInput(raw);
+    } catch (e) {
+      body.innerHTML = `<div class="result-banner warning">
+        <svg viewBox="0 0 24 24"><path d="M12 2L1 21h22L12 2zm0 3.5L20.5 19h-17L12 5.5zM11 10v4h2v-4h-2zm0 6v2h2v-2h-2z"/></svg>
+        Parse error: ${escHtml(e.message)}
+      </div>`;
+      return;
+    }
+    payload = { manifest: parsed, gatekeeperUrl: gatekeeperUrl || undefined, ignoreTls };
   }
 
   btn.disabled = true;
@@ -516,7 +726,7 @@ async function validate() {
     const res = await fetch("/validate", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ manifest, gatekeeperUrl: gatekeeperUrl || undefined, ignoreTls })
+      body: JSON.stringify(payload),
     });
 
     const data = await res.json();
@@ -533,13 +743,13 @@ async function validate() {
     } else if (data.allowed === true) {
       banner = `<div class="result-banner allowed">
         <svg viewBox="0 0 24 24"><path d="M9 16.2l-4.2-4.2-1.4 1.4L9 19 21 7l-1.4-1.4L9 16.2z"/></svg>
-        ALLOWED — Admission request accepted
+        ALLOWED &#8212; Admission request accepted
       </div>`;
       setStatus("ready", "allowed");
     } else if (data.allowed === false) {
       banner = `<div class="result-banner denied">
         <svg viewBox="0 0 24 24"><path d="M19 6.41L17.59 5 12 10.59 6.41 5 5 6.41 10.59 12 5 17.59 6.41 19 12 13.41 17.59 19 19 17.59 13.41 12z"/></svg>
-        DENIED — Admission request rejected
+        DENIED &#8212; Admission request rejected
       </div>`;
       setStatus("", "denied");
     } else {
@@ -562,7 +772,8 @@ async function validate() {
       ? `<pre class="json-tree">${colorizeJson(data.raw)}</pre>`
       : "");
 
-    document.getElementById("footerLeft").textContent = `HTTP ${data.status || res.status} · ${new Date().toLocaleTimeString()}`;
+    document.getElementById("footerLeft").textContent =
+      `HTTP ${data.status || res.status} · ${new Date().toLocaleTimeString()}`;
 
   } catch (err) {
     body.innerHTML = `<div class="result-banner warning">
@@ -577,6 +788,24 @@ async function validate() {
   }
 }
 
+/**
+ * Try to parse input as JSON, then YAML.
+ * Uses the js-yaml library if available (loaded from CDN).
+ */
+function parseInput(str) {
+  // Try JSON first
+  try { return JSON.parse(str); } catch {}
+
+  // Try YAML (js-yaml loaded from CDN as `jsyaml`)
+  if (typeof jsyaml !== "undefined") {
+    const parsed = jsyaml.load(str);
+    if (parsed && typeof parsed === "object") return parsed;
+    throw new Error("YAML parsed to a non-object value.");
+  }
+
+  throw new Error("Could not parse as JSON. YAML library unavailable.");
+}
+
 function copyResponse() {
   if (lastResponse) {
     navigator.clipboard.writeText(JSON.stringify(lastResponse, null, 2));
@@ -586,15 +815,10 @@ function copyResponse() {
   }
 }
 
-function escHtml(str) {
-  return String(str)
-    .replace(/&/g, "&amp;")
-    .replace(/</g, "&lt;")
-    .replace(/>/g, "&gt;")
-    .replace(/"/g, "&quot;");
-}
+// ── Init ───────────────────────────────────────────────────────────────────────
+updatePlaceholder();
 
-// keyboard shortcut: Ctrl/Cmd+Enter to validate
+// Keyboard shortcut: Ctrl/Cmd+Enter to validate
 document.addEventListener("keydown", e => {
   if ((e.ctrlKey || e.metaKey) && e.key === "Enter") validate();
 });
