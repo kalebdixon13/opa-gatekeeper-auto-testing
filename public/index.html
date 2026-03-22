@@ -1,0 +1,847 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Gatekeeper Admission Tester</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=IBM+Plex+Sans:wght@400;500;600&display=swap" rel="stylesheet">
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+    :root {
+      --bg:        #0d0f12;
+      --surface:   #13171e;
+      --border:    #222830;
+      --border-hi: #2e3847;
+      --text:      #c9d1d9;
+      --muted:     #4a5568;
+      --accent:    #38bdf8;
+      --accent-dim:#0c3553;
+      --green:     #22c55e;
+      --green-dim: #052e16;
+      --red:       #f87171;
+      --red-dim:   #2d0a0a;
+      --yellow:    #fbbf24;
+      --purple:    #a78bfa;
+      --purple-dim:#1e1433;
+      --mono:      'IBM Plex Mono', monospace;
+      --sans:      'IBM Plex Sans', sans-serif;
+    }
+
+    html, body { height: 100%; background: var(--bg); color: var(--text); font-family: var(--sans); font-size: 14px; line-height: 1.5; }
+
+    body::before {
+      content: '';
+      position: fixed; inset: 0;
+      background: repeating-linear-gradient(0deg, transparent, transparent 2px, rgba(0,0,0,.07) 2px, rgba(0,0,0,.07) 4px);
+      pointer-events: none; z-index: 9999;
+    }
+
+    .shell {
+      display: grid;
+      grid-template-rows: auto 1fr;
+      min-height: 100vh;
+      max-width: 1400px;
+      margin: 0 auto;
+      padding: 0 24px;
+    }
+
+    /* ── HEADER ── */
+    header {
+      display: flex; align-items: center; gap: 16px;
+      padding: 20px 0 16px;
+      border-bottom: 1px solid var(--border);
+      margin-bottom: 20px;
+    }
+    .logo-badge {
+      display: flex; align-items: center; gap: 8px;
+      background: var(--accent-dim); border: 1px solid var(--accent);
+      border-radius: 4px; padding: 6px 12px;
+    }
+    .logo-badge svg { width: 18px; height: 18px; fill: var(--accent); }
+    .logo-badge span { font-family: var(--mono); font-size: 11px; font-weight: 600; color: var(--accent); letter-spacing: .1em; text-transform: uppercase; }
+    .header-title { display: flex; flex-direction: column; }
+    .header-title h1 { font-family: var(--mono); font-size: 18px; font-weight: 600; color: #e6edf3; letter-spacing: -.01em; }
+    .header-title p { font-size: 12px; color: var(--muted); font-family: var(--mono); }
+    .status-pill { margin-left: auto; display: flex; align-items: center; gap: 6px; font-family: var(--mono); font-size: 11px; color: var(--muted); }
+    .status-pill .dot { width: 6px; height: 6px; border-radius: 50%; background: var(--muted); animation: pulse 2s infinite; }
+    .status-pill.ready .dot { background: var(--green); }
+    @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: .4; } }
+
+    /* ── TAB BAR ── */
+    .tab-bar {
+      display: flex; gap: 2px;
+      border-bottom: 1px solid var(--border);
+      margin-bottom: 20px;
+    }
+    .tab-btn {
+      font-family: var(--mono); font-size: 12px; font-weight: 600;
+      letter-spacing: .06em; text-transform: uppercase;
+      padding: 8px 18px;
+      border: none; border-bottom: 2px solid transparent;
+      background: transparent; color: var(--muted);
+      cursor: pointer; border-radius: 0;
+      transition: all .15s;
+      margin-bottom: -1px;
+    }
+    .tab-btn:hover { color: var(--text); border-color: var(--border-hi); }
+    .tab-btn.active { color: var(--accent); border-color: var(--accent); }
+    .tab-btn.capture-active-indicator::after {
+      content: '●';
+      color: var(--green);
+      margin-left: 6px;
+      font-size: 8px;
+      vertical-align: middle;
+    }
+
+    /* ── SHARED MAIN GRID ── */
+    .main {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      grid-template-rows: auto 1fr;
+      gap: 16px;
+      padding-bottom: 24px;
+    }
+    .capture-main {
+      display: none;
+      flex-direction: column;
+      gap: 16px;
+      padding-bottom: 24px;
+    }
+    .capture-main.visible { display: flex; }
+
+    /* ── CONFIG BAR ── */
+    .config-bar {
+      grid-column: 1 / -1; display: flex; align-items: center; gap: 12px;
+      background: var(--surface); border: 1px solid var(--border); border-radius: 6px; padding: 10px 14px;
+    }
+    .config-bar label { font-family: var(--mono); font-size: 11px; color: var(--muted); text-transform: uppercase; letter-spacing: .08em; white-space: nowrap; }
+    .config-bar input[type=text] {
+      flex: 1; background: var(--bg); border: 1px solid var(--border); border-radius: 4px;
+      color: var(--accent); font-family: var(--mono); font-size: 12px; padding: 6px 10px;
+      outline: none; transition: border-color .15s;
+    }
+    .config-bar input[type=text]:focus { border-color: var(--accent); }
+    .config-bar input[type=text]::placeholder { color: var(--muted); }
+    .ignore-tls-wrap { display: flex; align-items: center; gap: 6px; white-space: nowrap; }
+    .ignore-tls-wrap input[type=checkbox] { accent-color: var(--accent); }
+    .ignore-tls-wrap label { font-family: var(--mono); font-size: 11px; color: var(--muted); cursor: pointer; }
+
+    /* ── PANELS ── */
+    .panel {
+      background: var(--surface); border: 1px solid var(--border); border-radius: 6px;
+      display: flex; flex-direction: column; overflow: hidden;
+    }
+    .panel-header {
+      display: flex; align-items: center; justify-content: space-between;
+      padding: 8px 14px; border-bottom: 1px solid var(--border);
+      background: rgba(255,255,255,.02); gap: 10px; flex-wrap: wrap;
+    }
+    .panel-header-left { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+    .panel-label { font-family: var(--mono); font-size: 11px; font-weight: 600; letter-spacing: .1em; text-transform: uppercase; color: var(--muted); white-space: nowrap; }
+
+    /* ── SEGMENTED TOGGLE ── */
+    .seg-toggle { display: flex; border: 1px solid var(--border-hi); border-radius: 4px; overflow: hidden; }
+    .seg-toggle button { border: none; border-radius: 0; padding: 3px 10px; font-size: 10px; letter-spacing: .06em; text-transform: uppercase; color: var(--muted); background: transparent; }
+    .seg-toggle button:not(:last-child) { border-right: 1px solid var(--border-hi); }
+    .seg-toggle button.active { background: var(--accent-dim); color: var(--accent); }
+    .seg-toggle button:hover:not(.active) { color: var(--text); }
+
+    .panel-actions { display: flex; gap: 8px; flex-shrink: 0; }
+
+    button {
+      cursor: pointer; font-family: var(--mono); font-size: 11px;
+      border-radius: 4px; border: 1px solid var(--border-hi);
+      background: transparent; color: var(--text); padding: 4px 10px; transition: all .15s;
+    }
+    button:hover { border-color: var(--accent); color: var(--accent); }
+
+    .btn-validate {
+      background: var(--accent); border-color: var(--accent); color: #0d0f12; font-weight: 600; padding: 4px 14px;
+    }
+    .btn-validate:hover { background: #7dd3fc; border-color: #7dd3fc; color: #0d0f12; }
+    .btn-validate:disabled { opacity: .4; cursor: not-allowed; }
+    .btn-validate.loading { position: relative; color: transparent; }
+    .btn-validate.loading::after {
+      content: ''; position: absolute; inset: 0; margin: auto;
+      width: 12px; height: 12px; border: 2px solid #0d0f12; border-top-color: transparent;
+      border-radius: 50%; animation: spin .6s linear infinite;
+    }
+    @keyframes spin { to { transform: rotate(360deg); } }
+
+    .btn-danger { border-color: var(--red); color: var(--red); }
+    .btn-danger:hover { background: var(--red-dim); border-color: var(--red); color: var(--red); }
+
+    /* ── EDITOR ── */
+    .editor-wrap { flex: 1; position: relative; }
+    .editor {
+      width: 100%; height: 100%; min-height: 380px;
+      background: var(--bg); color: #e6edf3;
+      font-family: var(--mono); font-size: 12.5px; line-height: 1.65;
+      border: none; outline: none; padding: 14px; resize: none; tab-size: 2;
+    }
+    .editor::placeholder { color: var(--muted); }
+
+    /* ── RESPONSE PANEL ── */
+    .response-body { flex: 1; overflow-y: auto; padding: 14px; font-family: var(--mono); font-size: 12.5px; line-height: 1.65; }
+    .result-banner {
+      display: flex; align-items: center; gap: 10px;
+      border-radius: 5px; padding: 10px 14px; margin-bottom: 14px;
+      font-weight: 600; font-size: 13px; letter-spacing: .02em;
+    }
+    .result-banner.allowed  { background: var(--green-dim);  border: 1px solid var(--green);  color: var(--green); }
+    .result-banner.denied   { background: var(--red-dim);    border: 1px solid var(--red);    color: var(--red); }
+    .result-banner.warning  { background: #1a1200;           border: 1px solid var(--yellow); color: var(--yellow); }
+    .result-banner svg { width: 16px; height: 16px; fill: currentColor; flex-shrink: 0; }
+    .reason-block { background: var(--bg); border: 1px solid var(--border); border-radius: 4px; padding: 10px 12px; color: var(--text); font-size: 12px; margin-bottom: 14px; white-space: pre-wrap; word-break: break-word; }
+    .reason-block .reason-label { font-size: 10px; text-transform: uppercase; letter-spacing: .1em; color: var(--muted); margin-bottom: 6px; }
+    .json-tree { color: #e6edf3; white-space: pre-wrap; word-break: break-word; }
+    .json-key   { color: #79c0ff; }
+    .json-str   { color: #a5d6ff; }
+    .json-num   { color: #ffa657; }
+    .json-bool  { color: var(--yellow); }
+    .json-null  { color: var(--muted); }
+    .empty-state {
+      display: flex; flex-direction: column; align-items: center; justify-content: center;
+      height: 100%; gap: 10px; color: var(--muted); font-size: 12px; text-align: center;
+    }
+    .empty-state svg { width: 32px; height: 32px; opacity: .3; }
+
+    /* ── CAPTURE TAB ── */
+    .capture-config {
+      background: var(--surface); border: 1px solid var(--border); border-radius: 6px; padding: 16px 18px;
+    }
+    .capture-config-title {
+      font-family: var(--mono); font-size: 11px; font-weight: 600; text-transform: uppercase;
+      letter-spacing: .1em; color: var(--muted); margin-bottom: 14px;
+    }
+    .capture-fields {
+      display: grid; grid-template-columns: 1fr 1fr 1fr auto; gap: 12px; align-items: end;
+    }
+    .capture-field label {
+      display: block; font-family: var(--mono); font-size: 10px; text-transform: uppercase;
+      letter-spacing: .08em; color: var(--muted); margin-bottom: 5px;
+    }
+    .capture-field input[type=text] {
+      width: 100%; background: var(--bg); border: 1px solid var(--border); border-radius: 4px;
+      color: var(--text); font-family: var(--mono); font-size: 12px; padding: 6px 10px;
+      outline: none; transition: border-color .15s;
+    }
+    .capture-field input[type=text]:focus { border-color: var(--accent); }
+    .capture-field input[type=text]::placeholder { color: var(--muted); }
+    .ops-checkboxes { display: flex; gap: 10px; flex-wrap: wrap; padding: 6px 0; }
+    .ops-checkboxes label { font-family: var(--mono); font-size: 11px; color: var(--text); display: flex; align-items: center; gap: 4px; cursor: pointer; }
+    .ops-checkboxes input[type=checkbox] { accent-color: var(--accent); }
+
+    .btn-capture-start {
+      background: var(--green); border-color: var(--green); color: #0d0f12;
+      font-weight: 600; padding: 6px 16px; white-space: nowrap;
+    }
+    .btn-capture-start:hover { background: #4ade80; border-color: #4ade80; color: #0d0f12; }
+    .btn-capture-start:disabled { opacity: .4; cursor: not-allowed; }
+
+    .capture-status-bar {
+      display: flex; align-items: center; gap: 12px;
+      background: var(--surface); border: 1px solid var(--border); border-radius: 6px;
+      padding: 10px 16px; font-family: var(--mono); font-size: 11px; color: var(--muted);
+    }
+    .capture-status-bar.active { border-color: var(--green); }
+    .capture-dot { width: 7px; height: 7px; border-radius: 50%; background: var(--muted); flex-shrink: 0; }
+    .capture-dot.active { background: var(--green); animation: pulse 1.5s infinite; }
+    .capture-status-text { flex: 1; }
+    .capture-status-bar .capture-count {
+      background: var(--accent-dim); color: var(--accent);
+      border-radius: 10px; padding: 1px 8px; font-size: 10px;
+    }
+
+    .capture-list-panel {
+      background: var(--surface); border: 1px solid var(--border); border-radius: 6px;
+      display: flex; flex-direction: column; overflow: hidden; flex: 1; min-height: 420px;
+    }
+    .capture-list { flex: 1; overflow-y: auto; }
+    .capture-row {
+      border-bottom: 1px solid var(--border); cursor: pointer; transition: background .1s;
+    }
+    .capture-row:hover { background: rgba(255,255,255,.03); }
+    .capture-row-summary {
+      display: flex; align-items: center; gap: 10px;
+      padding: 9px 14px; font-family: var(--mono); font-size: 11.5px;
+    }
+    .capture-row-time { color: var(--muted); white-space: nowrap; flex-shrink: 0; }
+    .op-badge {
+      font-size: 9px; font-weight: 600; letter-spacing: .08em; text-transform: uppercase;
+      border-radius: 3px; padding: 2px 6px; flex-shrink: 0;
+    }
+    .op-badge.create { background: var(--green-dim);  color: var(--green); }
+    .op-badge.update { background: var(--accent-dim); color: var(--accent); }
+    .op-badge.delete { background: var(--red-dim);    color: var(--red); }
+    .op-badge.other  { background: rgba(255,255,255,.05); color: var(--muted); }
+    .capture-kind   { color: #e6edf3; font-weight: 600; }
+    .capture-name   { color: var(--accent); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; flex: 1; min-width: 0; }
+    .capture-ns     { color: var(--muted); white-space: nowrap; flex-shrink: 0; }
+    .capture-user   { color: var(--muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 220px; flex-shrink: 0; font-size: 10.5px; }
+    .expand-arrow   { color: var(--muted); flex-shrink: 0; font-size: 10px; transition: transform .15s; }
+    .capture-row.expanded .expand-arrow { transform: rotate(90deg); }
+
+    .capture-row-detail {
+      display: none; border-top: 1px solid var(--border);
+      background: var(--bg); padding: 12px 14px;
+    }
+    .capture-row.expanded .capture-row-detail { display: block; }
+    .capture-row-detail pre {
+      font-family: var(--mono); font-size: 11.5px; line-height: 1.6;
+      white-space: pre-wrap; word-break: break-word; color: #e6edf3;
+      max-height: 380px; overflow-y: auto;
+    }
+    .capture-detail-actions {
+      display: flex; gap: 8px; margin-bottom: 10px;
+    }
+    .btn-load-test {
+      background: var(--purple-dim); border-color: var(--purple); color: var(--purple);
+      font-weight: 600;
+    }
+    .btn-load-test:hover { background: #2e1a5e; }
+
+    /* scrollbar */
+    ::-webkit-scrollbar { width: 6px; height: 6px; }
+    ::-webkit-scrollbar-track { background: transparent; }
+    ::-webkit-scrollbar-thumb { background: var(--border-hi); border-radius: 3px; }
+
+    /* footer */
+    .footer-bar {
+      grid-column: 1/-1; display: flex; justify-content: space-between; align-items: center;
+      padding: 0 0 12px; font-family: var(--mono); font-size: 11px; color: var(--muted);
+    }
+
+    @media (max-width: 860px) {
+      .main { grid-template-columns: 1fr; }
+      .config-bar { flex-wrap: wrap; }
+      .capture-fields { grid-template-columns: 1fr; }
+    }
+  </style>
+</head>
+<body>
+<div class="shell">
+
+  <header>
+    <div class="logo-badge">
+      <svg viewBox="0 0 24 24"><path d="M12 2L2 7v10l10 5 10-5V7L12 2zm0 2.18L20 8.5v7L12 19.82 4 15.5v-7L12 4.18z"/></svg>
+      <span>OPA</span>
+    </div>
+    <div class="header-title">
+      <h1>Gatekeeper Admission Tester</h1>
+      <p>validating admission webhook // manifest linter</p>
+    </div>
+    <div class="status-pill" id="statusPill">
+      <span class="dot"></span>
+      <span id="statusText">idle</span>
+    </div>
+  </header>
+
+  <!-- TAB BAR -->
+  <div class="tab-bar">
+    <button class="tab-btn active" id="tabTest" onclick="switchTab('test')">Test</button>
+    <button class="tab-btn" id="tabCapture" onclick="switchTab('capture')">Capture</button>
+  </div>
+
+  <!-- ═══════════════ TEST TAB ═══════════════ -->
+  <div class="main" id="testTab">
+
+    <div class="config-bar">
+      <label>Webhook URL</label>
+      <input type="text" id="gatekeeperUrl"
+        placeholder="https://gatekeeper-webhook.gatekeeper-system.svc:8443/v1/admit" value="" />
+      <div class="ignore-tls-wrap">
+        <input type="checkbox" id="ignoreTls" />
+        <label for="ignoreTls">Skip TLS verify</label>
+      </div>
+    </div>
+
+    <div class="panel">
+      <div class="panel-header">
+        <div class="panel-header-left">
+          <span class="panel-label">input</span>
+          <div class="seg-toggle" id="modeToggle">
+            <button class="active" onclick="setMode('manifest')">manifest</button>
+            <button onclick="setMode('full-request')">full request</button>
+          </div>
+          <div class="seg-toggle" id="formatToggle">
+            <button class="active" onclick="setFormat('yaml')">yaml</button>
+            <button onclick="setFormat('json')">json</button>
+          </div>
+        </div>
+        <div class="panel-actions">
+          <button onclick="loadExample()">example</button>
+          <button onclick="clearInput()">clear</button>
+          <button class="btn-validate" id="validateBtn" onclick="validate()">&#9654; validate</button>
+        </div>
+      </div>
+      <div class="editor-wrap">
+        <textarea class="editor" id="manifestInput" spellcheck="false"></textarea>
+      </div>
+    </div>
+
+    <div class="panel">
+      <div class="panel-header">
+        <span class="panel-label">admission response</span>
+        <div class="panel-actions">
+          <button id="copyBtn" onclick="copyResponse()" style="display:none">copy json</button>
+          <button onclick="clearResponse()">clear</button>
+        </div>
+      </div>
+      <div class="response-body" id="responseBody">
+        <div class="empty-state">
+          <svg viewBox="0 0 24 24"><path d="M9 5H7a2 2 0 00-2 2v12a2 2 0 002 2h10a2 2 0 002-2V7a2 2 0 00-2-2h-2M9 5a2 2 0 002 2h2a2 2 0 002-2M9 5a2 2 0 012-2h2a2 2 0 012 2"/></svg>
+          <span>Submit a manifest to see<br>the admission decision here.</span>
+        </div>
+      </div>
+    </div>
+
+    <div class="footer-bar">
+      <span id="footerLeft">ready</span>
+      <span id="footerRight">proxied via /validate</span>
+    </div>
+
+  </div><!-- end #testTab -->
+
+  <!-- ═══════════════ CAPTURE TAB ═══════════════ -->
+  <div class="capture-main" id="captureTab">
+
+    <!-- Config card (hidden while capture is active) -->
+    <div class="capture-config" id="captureConfigCard">
+      <div class="capture-config-title">Capture Configuration</div>
+      <div class="capture-fields">
+        <div class="capture-field">
+          <label>Namespace filter</label>
+          <input type="text" id="captureNamespaces" placeholder="default,kube-system  (blank = all)" />
+        </div>
+        <div class="capture-field">
+          <label>Operations</label>
+          <div class="ops-checkboxes">
+            <label><input type="checkbox" id="opCreate" checked> CREATE</label>
+            <label><input type="checkbox" id="opUpdate" checked> UPDATE</label>
+            <label><input type="checkbox" id="opDelete" checked> DELETE</label>
+          </div>
+        </div>
+        <div class="capture-field">
+          <label>Resources</label>
+          <input type="text" id="captureResources" placeholder="*  (or: pods,deployments)" />
+        </div>
+        <div>
+          <button class="btn-capture-start" id="startCaptureBtn" onclick="startCapture()">&#9654; Start Capture</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- Status bar (shown while capture is active) -->
+    <div class="capture-status-bar" id="captureStatusBar" style="display:none">
+      <span class="capture-dot active"></span>
+      <span class="capture-status-text" id="captureStatusText">Capturing&#8230;</span>
+      <span class="capture-count" id="captureCount">0</span>
+      <button class="btn-danger" onclick="stopCapture()">&#9632; Stop</button>
+      <button onclick="clearCaptured()">clear</button>
+    </div>
+
+    <!-- Captured requests list -->
+    <div class="capture-list-panel">
+      <div class="panel-header">
+        <span class="panel-label">captured admission reviews</span>
+        <div class="panel-actions" id="captureListActions" style="display:none">
+          <button onclick="clearCaptured()">clear all</button>
+        </div>
+      </div>
+      <div class="capture-list" id="captureList">
+        <div class="empty-state" id="captureEmptyState">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><path stroke-linecap="round" stroke-linejoin="round" d="M12 9v3.75m-9.303 3.376c-.866 1.5.217 3.374 1.948 3.374h14.71c1.73 0 2.813-1.874 1.948-3.374L13.949 3.378c-.866-1.5-3.032-1.5-3.898 0L2.697 16.126zM12 15.75h.007v.008H12v-.008z"/></svg>
+          <span>Start capture, then run kubectl commands.<br>Real admission reviews will appear here.</span>
+        </div>
+      </div>
+    </div>
+
+  </div><!-- end #captureTab -->
+
+</div><!-- end .shell -->
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/js-yaml/4.1.0/js-yaml.min.js"></script>
+<script>
+// ═══════════════ SHARED STATE ═══════════════════════════════════════════════
+let lastResponse  = null;
+let inputMode     = "manifest";
+let inputFormat   = "yaml";
+let activeTab     = "test";
+
+// Capture state
+let captureActive  = false;
+let captureItems   = [];   // local mirror of the ring buffer (keyed by id)
+let captureSeenIds = new Set();
+let capturePollTimer = null;
+
+// ═══════════════ TAB SWITCHING ═══════════════════════════════════════════════
+function switchTab(tab) {
+  activeTab = tab;
+  document.getElementById("testTab").style.display    = tab === "test"    ? "" : "none";
+  const captureEl = document.getElementById("captureTab");
+  captureEl.classList.toggle("visible", tab === "capture");
+  document.getElementById("tabTest").classList.toggle("active", tab === "test");
+  document.getElementById("tabCapture").classList.toggle("active", tab === "capture");
+  if (tab === "capture") refreshCaptureStatus();
+}
+
+// ═══════════════ TEST TAB ════════════════════════════════════════════════════
+
+const EXAMPLE_YAML = `apiVersion: v1
+kind: Pod
+metadata:
+  name: example-pod
+  namespace: default
+  labels:
+    app: demo
+spec:
+  containers:
+    - name: web
+      image: nginx:latest
+      ports:
+        - containerPort: 80
+      resources:
+        requests:
+          cpu: "100m"
+          memory: "128Mi"
+`;
+const EXAMPLE_JSON = JSON.stringify({
+  apiVersion:"v1", kind:"Pod",
+  metadata:{name:"example-pod",namespace:"default",labels:{app:"demo"}},
+  spec:{containers:[{name:"web",image:"nginx:latest",ports:[{containerPort:80}],resources:{requests:{cpu:"100m",memory:"128Mi"}}}]}
+},null,2);
+const EXAMPLE_FULL_REQUEST = JSON.stringify({
+  apiVersion:"admission.k8s.io/v1", kind:"AdmissionReview",
+  request:{
+    uid:"test-00000000",
+    kind:{group:"",version:"v1",kind:"Pod"},
+    resource:{group:"",version:"v1",resource:"pods"},
+    name:"example-pod", namespace:"default", operation:"CREATE",
+    userInfo:{username:"system:serviceaccount:kube-system:deployment-controller",groups:["system:serviceaccounts","system:authenticated"]},
+    object:{apiVersion:"v1",kind:"Pod",metadata:{name:"example-pod",namespace:"default",labels:{app:"demo"}},spec:{containers:[{name:"web",image:"nginx:latest"}]}}
+  }
+},null,2);
+
+const PLACEHOLDER_YAML = `apiVersion: v1\nkind: Pod\nmetadata:\n  name: my-pod\n  namespace: default\nspec:\n  containers:\n    - name: app\n      image: nginx:latest`;
+const PLACEHOLDER_JSON = `{\n  "apiVersion": "v1",\n  "kind": "Pod",\n  "metadata": { "name": "my-pod", "namespace": "default" },\n  "spec": { "containers": [{ "name": "app", "image": "nginx:latest" }] }\n}`;
+const PLACEHOLDER_FULL = `{\n  "apiVersion": "admission.k8s.io/v1",\n  "kind": "AdmissionReview",\n  "request": {\n    "uid": "test-00000000",\n    "kind": { "group": "", "version": "v1", "kind": "Pod" },\n    "operation": "CREATE",\n    "userInfo": { "username": "alice", "groups": ["system:authenticated"] },\n    "object": { ... }\n  }\n}`;
+
+function setMode(mode) {
+  inputMode = mode;
+  document.querySelectorAll("#modeToggle button")[0].classList.toggle("active", mode==="manifest");
+  document.querySelectorAll("#modeToggle button")[1].classList.toggle("active", mode==="full-request");
+  document.getElementById("formatToggle").style.display = mode==="manifest" ? "" : "none";
+  updatePlaceholder();
+}
+function setFormat(fmt) {
+  inputFormat = fmt;
+  document.querySelectorAll("#formatToggle button")[0].classList.toggle("active", fmt==="yaml");
+  document.querySelectorAll("#formatToggle button")[1].classList.toggle("active", fmt==="json");
+  updatePlaceholder();
+}
+function updatePlaceholder() {
+  const ta = document.getElementById("manifestInput");
+  if (inputMode==="full-request") ta.placeholder = PLACEHOLDER_FULL;
+  else if (inputFormat==="yaml")  ta.placeholder = PLACEHOLDER_YAML;
+  else                            ta.placeholder = PLACEHOLDER_JSON;
+}
+function loadExample() {
+  document.getElementById("manifestInput").value =
+    inputMode==="full-request" ? EXAMPLE_FULL_REQUEST :
+    inputFormat==="yaml"       ? EXAMPLE_YAML : EXAMPLE_JSON;
+}
+function clearInput()    { document.getElementById("manifestInput").value = ""; }
+function clearResponse() {
+  lastResponse = null;
+  document.getElementById("copyBtn").style.display = "none";
+  document.getElementById("responseBody").innerHTML = `<div class="empty-state"><svg viewBox="0 0 24 24"><path d="M9 5H7a2 2 0 00-2 2v12a2 2 0 002 2h10a2 2 0 002-2V7a2 2 0 00-2-2h-2M9 5a2 2 0 002 2h2a2 2 0 002-2M9 5a2 2 0 012-2h2a2 2 0 012 2"/></svg><span>Submit a manifest to see<br>the admission decision here.</span></div>`;
+}
+function setStatus(state, text) {
+  document.getElementById("statusPill").className = "status-pill " + (state==="ready"?"ready":"");
+  document.getElementById("statusText").textContent = text;
+}
+
+function colorizeJson(obj) {
+  return JSON.stringify(obj,null,2).replace(
+    /("(\\u[a-zA-Z0-9]{4}|\\[^u]|[^\\"])*"(\s*:)?|\b(true|false|null)\b|-?\d+(?:\.\d*)?(?:[eE][+\-]?\d+)?)/g,
+    m => {
+      if (/^"/.test(m)) return /:$/.test(m) ? `<span class="json-key">${m}</span>` : `<span class="json-str">${m}</span>`;
+      if (/true|false/.test(m)) return `<span class="json-bool">${m}</span>`;
+      if (/null/.test(m))       return `<span class="json-null">${m}</span>`;
+      return `<span class="json-num">${m}</span>`;
+    }
+  );
+}
+function escHtml(s) {
+  return String(s).replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;").replace(/"/g,"&quot;");
+}
+function parseInput(str) {
+  try { return JSON.parse(str); } catch {}
+  if (typeof jsyaml !== "undefined") {
+    const p = jsyaml.load(str);
+    if (p && typeof p === "object") return p;
+    throw new Error("YAML parsed to a non-object value.");
+  }
+  throw new Error("Could not parse as JSON. YAML library unavailable.");
+}
+
+async function validate() {
+  const raw = document.getElementById("manifestInput").value.trim();
+  const gatekeeperUrl = document.getElementById("gatekeeperUrl").value.trim();
+  const ignoreTls = document.getElementById("ignoreTls").checked;
+  const btn  = document.getElementById("validateBtn");
+  const body = document.getElementById("responseBody");
+
+  if (!raw) {
+    body.innerHTML = `<div class="result-banner warning"><svg viewBox="0 0 24 24"><path d="M12 2L1 21h22L12 2zm0 3.5L20.5 19h-17L12 5.5zM11 10v4h2v-4h-2zm0 6v2h2v-2h-2z"/></svg>No input provided.</div>`;
+    return;
+  }
+
+  let payload;
+  try {
+    const parsed = parseInput(raw);
+    payload = inputMode === "full-request"
+      ? { admissionRequest: parsed, gatekeeperUrl: gatekeeperUrl||undefined, ignoreTls }
+      : { manifest: parsed,         gatekeeperUrl: gatekeeperUrl||undefined, ignoreTls };
+  } catch(e) {
+    body.innerHTML = `<div class="result-banner warning"><svg viewBox="0 0 24 24"><path d="M12 2L1 21h22L12 2zm0 3.5L20.5 19h-17L12 5.5zM11 10v4h2v-4h-2zm0 6v2h2v-2h-2z"/></svg>Parse error: ${escHtml(e.message)}</div>`;
+    return;
+  }
+
+  btn.disabled = true; btn.classList.add("loading");
+  setStatus("","validating...");
+  document.getElementById("footerLeft").textContent = "sending to gatekeeper...";
+
+  try {
+    const res  = await fetch("/validate",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(payload)});
+    const data = await res.json();
+    lastResponse = data;
+    document.getElementById("copyBtn").style.display = "inline-block";
+
+    let banner = "";
+    if (data.error) {
+      banner = `<div class="result-banner warning"><svg viewBox="0 0 24 24"><path d="M12 2L1 21h22L12 2zm0 3.5L20.5 19h-17L12 5.5zM11 10v4h2v-4h-2zm0 6v2h2v-2h-2z"/></svg>Proxy Error: ${escHtml(data.error)}</div>`;
+      setStatus("","error");
+    } else if (data.allowed===true) {
+      banner = `<div class="result-banner allowed"><svg viewBox="0 0 24 24"><path d="M9 16.2l-4.2-4.2-1.4 1.4L9 19 21 7l-1.4-1.4L9 16.2z"/></svg>ALLOWED &#8212; Admission request accepted</div>`;
+      setStatus("ready","allowed");
+    } else if (data.allowed===false) {
+      banner = `<div class="result-banner denied"><svg viewBox="0 0 24 24"><path d="M19 6.41L17.59 5 12 10.59 6.41 5 5 6.41 10.59 12 5 17.59 6.41 19 12 13.41 17.59 19 19 17.59 13.41 12z"/></svg>DENIED &#8212; Admission request rejected</div>`;
+      setStatus("","denied");
+    } else {
+      banner = `<div class="result-banner warning"><svg viewBox="0 0 24 24"><path d="M12 2L1 21h22L12 2zm0 3.5L20.5 19h-17L12 5.5zM11 10v4h2v-4h-2zm0 6v2h2v-2h-2z"/></svg>Unexpected response format</div>`;
+      setStatus("","unknown");
+    }
+    const reasonHtml = data.status_message
+      ? `<div class="reason-block"><div class="reason-label">denial reason</div>${escHtml(data.status_message)}</div>` : "";
+    body.innerHTML = banner + reasonHtml + (data.raw ? `<pre class="json-tree">${colorizeJson(data.raw)}</pre>` : "");
+    document.getElementById("footerLeft").textContent = `HTTP ${data.status||res.status} · ${new Date().toLocaleTimeString()}`;
+  } catch(err) {
+    body.innerHTML = `<div class="result-banner warning"><svg viewBox="0 0 24 24"><path d="M12 2L1 21h22L12 2zm0 3.5L20.5 19h-17L12 5.5zM11 10v4h2v-4h-2zm0 6v2h2v-2h-2z"/></svg>Network error: ${escHtml(err.message)}</div>`;
+    setStatus("","error");
+    document.getElementById("footerLeft").textContent = "request failed";
+  } finally {
+    btn.disabled = false; btn.classList.remove("loading");
+  }
+}
+
+function copyResponse() {
+  if (!lastResponse) return;
+  navigator.clipboard.writeText(JSON.stringify(lastResponse,null,2));
+  const btn = document.getElementById("copyBtn");
+  btn.textContent = "copied!";
+  setTimeout(() => btn.textContent = "copy json", 1500);
+}
+
+// ═══════════════ CAPTURE TAB ════════════════════════════════════════════════
+
+async function refreshCaptureStatus() {
+  try {
+    const r = await fetch("/capture/status");
+    const s = await r.json();
+    captureActive = s.active;
+    updateCaptureUI(s);
+  } catch {}
+}
+
+function updateCaptureUI(status) {
+  const configCard  = document.getElementById("captureConfigCard");
+  const statusBar   = document.getElementById("captureStatusBar");
+  const tabBtn      = document.getElementById("tabCapture");
+
+  if (status.active) {
+    configCard.style.display = "none";
+    statusBar.style.display  = "flex";
+    tabBtn.classList.add("capture-active-indicator");
+    document.getElementById("captureStatusText").textContent =
+      `Capturing · SAN: ${status.certSan} · port ${status.capturePort}`;
+    document.getElementById("captureCount").textContent = status.requestCount;
+    schedulePoll();
+  } else {
+    configCard.style.display = "";
+    statusBar.style.display  = "none";
+    tabBtn.classList.remove("capture-active-indicator");
+    stopPoll();
+  }
+}
+
+async function startCapture() {
+  const btn = document.getElementById("startCaptureBtn");
+  btn.disabled = true;
+
+  const namespaces = document.getElementById("captureNamespaces").value.trim()
+    .split(",").map(s=>s.trim()).filter(Boolean);
+  const operations = ["opCreate","opUpdate","opDelete"]
+    .filter(id => document.getElementById(id).checked)
+    .map(id => id.replace("op","").toUpperCase());
+  const resources = document.getElementById("captureResources").value.trim()
+    .split(",").map(s=>s.trim()).filter(Boolean);
+
+  try {
+    const res = await fetch("/capture/start",{
+      method:"POST",
+      headers:{"Content-Type":"application/json"},
+      body:JSON.stringify({ namespaces, operations, resources })
+    });
+    const data = await res.json();
+    if (data.error) {
+      alert(`Could not start capture:\n${data.error}`);
+    } else {
+      captureActive = true;
+      updateCaptureUI(data);
+    }
+  } catch(e) {
+    alert(`Network error: ${e.message}`);
+  } finally {
+    btn.disabled = false;
+  }
+}
+
+async function stopCapture() {
+  try {
+    await fetch("/capture/stop",{method:"POST"});
+    captureActive = false;
+    stopPoll();
+    updateCaptureUI({ active:false });
+  } catch(e) {
+    alert(`Network error: ${e.message}`);
+  }
+}
+
+async function clearCaptured() {
+  try {
+    await fetch("/captured",{method:"DELETE"});
+    captureItems   = [];
+    captureSeenIds = new Set();
+    document.getElementById("captureList").innerHTML = "";
+    document.getElementById("captureEmptyState").style.display = "";
+    document.getElementById("captureListActions").style.display = "none";
+    document.getElementById("captureCount").textContent = "0";
+  } catch(e) {
+    alert(`Network error: ${e.message}`);
+  }
+}
+
+function schedulePoll() {
+  if (capturePollTimer) return;
+  capturePollTimer = setInterval(pollCaptured, 2000);
+  pollCaptured();
+}
+function stopPoll() {
+  clearInterval(capturePollTimer);
+  capturePollTimer = null;
+}
+
+async function pollCaptured() {
+  try {
+    const res  = await fetch("/captured");
+    const items = await res.json();
+    let hasNew = false;
+    // Items are newest-first; find those we haven't rendered yet.
+    for (const item of items) {
+      if (!captureSeenIds.has(item.id)) {
+        captureSeenIds.add(item.id);
+        prependCaptureRow(item);
+        hasNew = true;
+      }
+    }
+    if (hasNew || items.length === 0) {
+      document.getElementById("captureEmptyState").style.display = items.length ? "none" : "";
+      document.getElementById("captureListActions").style.display = items.length ? "flex" : "none";
+      document.getElementById("captureCount").textContent = items.length;
+    }
+  } catch {}
+}
+
+function opBadgeClass(op) {
+  if (!op) return "other";
+  return op==="CREATE"?"create": op==="UPDATE"?"update": op==="DELETE"?"delete":"other";
+}
+
+function prependCaptureRow(item) {
+  const list = document.getElementById("captureList");
+  const emptyState = document.getElementById("captureEmptyState");
+
+  const time = new Date(item.timestamp).toLocaleTimeString();
+  const row  = document.createElement("div");
+  row.className = "capture-row";
+  row.dataset.id = item.id;
+
+  row.innerHTML = `
+    <div class="capture-row-summary" onclick="toggleRow(this.closest('.capture-row'))">
+      <span class="expand-arrow">&#9656;</span>
+      <span class="capture-row-time">${escHtml(time)}</span>
+      <span class="op-badge ${opBadgeClass(item.operation)}">${escHtml(item.operation||"?")}</span>
+      <span class="capture-kind">${escHtml(item.kind||"?")}</span>
+      <span class="capture-name">${escHtml(item.name||"")}</span>
+      <span class="capture-ns">${escHtml(item.namespace||"")}</span>
+      <span class="capture-user">${escHtml(item.username||"")}</span>
+    </div>
+    <div class="capture-row-detail">
+      <div class="capture-detail-actions">
+        <button class="btn-load-test" onclick="loadIntoTest(this)">&#8599; Load into Test</button>
+        <button onclick="copyRowJson(this)">copy json</button>
+      </div>
+      <pre class="json-tree">${colorizeJson(item.review)}</pre>
+    </div>`;
+
+  // Store review on element for quick access
+  row._review = item.review;
+
+  // Insert before the empty-state (or prepend)
+  list.insertBefore(row, emptyState);
+}
+
+function toggleRow(row) {
+  row.classList.toggle("expanded");
+}
+
+function loadIntoTest(btn) {
+  const row = btn.closest(".capture-row");
+  const review = row._review;
+  setMode("full-request");
+  document.getElementById("manifestInput").value = JSON.stringify(review, null, 2);
+  switchTab("test");
+}
+
+function copyRowJson(btn) {
+  const row = btn.closest(".capture-row");
+  navigator.clipboard.writeText(JSON.stringify(row._review, null, 2));
+  btn.textContent = "copied!";
+  setTimeout(() => btn.textContent = "copy json", 1500);
+}
+
+// ═══════════════ INIT ════════════════════════════════════════════════════════
+updatePlaceholder();
+// Show test tab by default (capture-main starts hidden)
+document.getElementById("testTab").style.display = "";
+
+document.addEventListener("keydown", e => {
+  if ((e.ctrlKey || e.metaKey) && e.key === "Enter" && activeTab === "test") validate();
+});
+</script>
+</body>
+</html>

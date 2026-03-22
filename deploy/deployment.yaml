@@ -1,0 +1,58 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: gatekeeper-tester
+  namespace: gatekeeper-system
+  labels:
+    app: gatekeeper-tester
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: gatekeeper-tester
+  template:
+    metadata:
+      labels:
+        app: gatekeeper-tester
+    spec:
+      serviceAccountName: gatekeeper-tester
+      containers:
+        - name: gatekeeper-tester
+          image: gatekeeper-tester:latest
+          imagePullPolicy: Never   # remove if pulling from a registry
+          ports:
+            - name: http
+              containerPort: 3000
+            - name: capture
+              containerPort: 8443
+          env:
+            # Injected via downward API so the TLS SAN matches the service DNS
+            - name: POD_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+            - name: SERVICE_NAME
+              value: "gatekeeper-tester"
+            # Gatekeeper webhook URL (adjust if different)
+            - name: GATEKEEPER_URL
+              value: "https://gatekeeper-webhook-service.gatekeeper-system.svc:8443/v1/admit"
+            - name: IGNORE_TLS
+              value: "true"
+            # Optional: increase capture ring buffer size
+            # - name: CAPTURE_MAX
+            #   value: "200"
+            # Optional: change capture port
+            # - name: CAPTURE_PORT
+            #   value: "8443"
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 3000
+            initialDelaySeconds: 3
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 3000
+            initialDelaySeconds: 5
+            periodSeconds: 30

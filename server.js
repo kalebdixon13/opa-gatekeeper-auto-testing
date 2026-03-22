@@ -1,16 +1,31 @@
-const http = require("http");
+const http  = require("http");
 const https = require("https");
-const fs = require("fs");
-const path = require("path");
-const url = require("url");
+const fs    = require("fs");
+const path  = require("path");
+const url   = require("url");
+
+// ── Optional dependencies (graceful degradation if missing) ───────────────────
 
 let yaml;
 try { yaml = require("js-yaml"); } catch { yaml = null; }
 
-const GATEKEEPER_URL = process.env.GATEKEEPER_URL || "https://gatekeeper-webhook.gatekeeper-system.svc:8443/v1/admit";
-const IGNORE_TLS = process.env.IGNORE_TLS === "true";
-const PORT = process.env.PORT || 3000;
+let selfsigned;
+try { selfsigned = require("selfsigned"); } catch { selfsigned = null; }
 
+let k8s;
+try { k8s = require("@kubernetes/client-node"); } catch { k8s = null; }
+
+// ── Environment ───────────────────────────────────────────────────────────────
+
+const GATEKEEPER_URL  = process.env.GATEKEEPER_URL || "https://gatekeeper-webhook.gatekeeper-system.svc:8443/v1/admit";
+const IGNORE_TLS      = process.env.IGNORE_TLS === "true";
+const PORT            = parseInt(process.env.PORT)         || 3000;
+const CAPTURE_PORT    = parseInt(process.env.CAPTURE_PORT) || 8443;
+const SERVICE_NAME    = process.env.SERVICE_NAME    || "gatekeeper-tester";
+const POD_NAMESPACE   = process.env.POD_NAMESPACE   || "gatekeeper-system";
+const CAPTURE_MAX     = parseInt(process.env.CAPTURE_MAX)  || 100;
+
+// Outbound mTLS certs (for forwarding to Gatekeeper)
 const TLS_CERT = process.env.TLS_CERT_PATH ? fs.readFileSync(process.env.TLS_CERT_PATH) : null;
 const TLS_KEY  = process.env.TLS_KEY_PATH  ? fs.readFileSync(process.env.TLS_KEY_PATH)  : null;
 const TLS_CA   = process.env.TLS_CA_PATH   ? fs.readFileSync(process.env.TLS_CA_PATH)   : null;
@@ -24,7 +39,154 @@ const MIME_TYPES = {
   ".ico":  "image/x-icon",
 };
 
-// ── Helpers ──────────────────────────────────────────────────────────────────
+// ── Self-signed TLS cert for the capture HTTPS server ─────────────────────────
+
+const CAPTURE_SAN = `${SERVICE_NAME}.${POD_NAMESPACE}.svc`;
+let capturePems   = null;
+let CAPTURE_CA_BUNDLE = null;
+let captureServerStarted = false;
+
+if (selfsigned) {
+  try {
+    capturePems = selfsigned.generate(
+      [{ name: "commonName", value: CAPTURE_SAN }],
+      {
+        days: 365,
+        keySize: 2048,
+        extensions: [{
+          name: "subjectAltName",
+          altNames: [
+            { type: 2, value: CAPTURE_SAN },
+            { type: 2, value: `${CAPTURE_SAN}.cluster.local` },
+            { type: 7, ip: "127.0.0.1" },
+          ],
+        }],
+      }
+    );
+    CAPTURE_CA_BUNDLE = Buffer.from(capturePems.cert).toString("base64");
+    console.log(`Capture cert generated (SAN=${CAPTURE_SAN})`);
+  } catch (e) {
+    console.error("Failed to generate capture cert:", e.message);
+  }
+}
+
+// ── Capture ring buffer ────────────────────────────────────────────────────────
+
+let capturedRequests = [];   // newest first
+let captureActive    = false;
+let captureConfig    = {};
+
+function addCaptured(admissionReview) {
+  const r = admissionReview.request || {};
+  capturedRequests.unshift({
+    id:        `${Date.now()}-${Math.random().toString(36).slice(2, 7)}`,
+    timestamp: new Date().toISOString(),
+    kind:      r.kind?.kind      || "Unknown",
+    name:      r.name            || "",
+    namespace: r.namespace       || "",
+    operation: r.operation       || "",
+    username:  r.userInfo?.username || "",
+    review:    admissionReview,
+  });
+  if (capturedRequests.length > CAPTURE_MAX) capturedRequests.length = CAPTURE_MAX;
+}
+
+// ── HTTPS capture server (receives real AdmissionReview from kube-apiserver) ──
+
+if (capturePems) {
+  const captureServer = https.createServer(
+    { key: capturePems.private, cert: capturePems.cert },
+    (req, res) => {
+      const { pathname } = url.parse(req.url);
+      if (req.method === "POST" && pathname === "/capture") {
+        readBody(req).then(body => {
+          let ar;
+          try { ar = JSON.parse(body); } catch {
+            res.writeHead(400); res.end(); return;
+          }
+          // Always respond allowed:true — this webhook must never block the cluster.
+          res.writeHead(200, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({
+            apiVersion: "admission.k8s.io/v1",
+            kind: "AdmissionReview",
+            response: { uid: ar.request?.uid || "", allowed: true },
+          }));
+          // Store after responding so latency is unaffected.
+          if (captureActive) addCaptured(ar);
+        }).catch(() => { res.writeHead(500); res.end(); });
+      } else {
+        res.writeHead(404); res.end();
+      }
+    }
+  );
+
+  captureServer.on("error", (e) => {
+    console.error(`Capture HTTPS server error (port ${CAPTURE_PORT}):`, e.message);
+  });
+
+  captureServer.listen(CAPTURE_PORT, () => {
+    captureServerStarted = true;
+    console.log(`Capture webhook listening on :${CAPTURE_PORT} (HTTPS)`);
+  });
+}
+
+// ── Kubernetes client helpers ──────────────────────────────────────────────────
+
+function isInCluster() {
+  return fs.existsSync("/var/run/secrets/kubernetes.io/serviceaccount/token");
+}
+
+function getAdmissionClient() {
+  if (!k8s) throw new Error("@kubernetes/client-node is not installed.");
+  const kc = new k8s.KubeConfig();
+  isInCluster() ? kc.loadFromCluster() : kc.loadFromDefault();
+  return kc.makeApiClient(k8s.AdmissionregistrationV1Api);
+}
+
+const VWC_NAME = "gatekeeper-tester-capture";
+
+function buildVWC(config) {
+  const ops       = config.operations?.length ? config.operations : ["CREATE", "UPDATE", "DELETE"];
+  const resources = config.resources?.length  ? config.resources  : ["*"];
+  const nsSelector = config.namespaces?.length
+    ? { matchExpressions: [{ key: "kubernetes.io/metadata.name", operator: "In", values: config.namespaces }] }
+    : undefined;
+
+  return {
+    apiVersion: "admissionregistration.k8s.io/v1",
+    kind: "ValidatingWebhookConfiguration",
+    metadata: {
+      name:   VWC_NAME,
+      labels: { app: "gatekeeper-tester" },
+    },
+    webhooks: [{
+      name:                    "capture.gatekeeper-tester.io",
+      admissionReviewVersions: ["v1"],
+      clientConfig: {
+        service: {
+          name:      SERVICE_NAME,
+          namespace: POD_NAMESPACE,
+          port:      CAPTURE_PORT,
+          path:      "/capture",
+        },
+        caBundle: CAPTURE_CA_BUNDLE,
+      },
+      rules: [{
+        apiGroups:   ["*"],
+        apiVersions: ["*"],
+        operations:  ops,
+        resources,
+        scope: "*",
+      }],
+      ...(nsSelector ? { namespaceSelector: nsSelector } : {}),
+      failurePolicy:  "Ignore",
+      sideEffects:    "None",
+      timeoutSeconds: 5,
+    }],
+  };
+}
+
+// ── Generic helpers ────────────────────────────────────────────────────────────
 
 function sendJson(res, status, obj) {
   res.writeHead(status, { "Content-Type": "application/json" });
@@ -35,39 +197,27 @@ function readBody(req) {
   return new Promise((resolve, reject) => {
     let body = "";
     req.on("data", chunk => body += chunk);
-    req.on("end", () => resolve(body));
+    req.on("end",  () => resolve(body));
     req.on("error", reject);
   });
 }
 
 function serveStatic(req, res) {
-  const filePath = path.join(__dirname, req.url === "/" ? "index.html" : req.url);
+  const filePath = path.join(__dirname, "public", req.url === "/" ? "index.html" : req.url);
   const ext = path.extname(filePath);
   const contentType = MIME_TYPES[ext] || "text/plain";
 
   fs.readFile(filePath, (err, data) => {
-    if (err) {
-      res.writeHead(404);
-      res.end("Not found");
-      return;
-    }
+    if (err) { res.writeHead(404); res.end("Not found"); return; }
     res.writeHead(200, { "Content-Type": contentType });
     res.end(data);
   });
 }
 
-/**
- * Parse a manifest string as JSON first, then YAML as fallback.
- * Accepts an already-parsed object and returns it as-is.
- */
 function parseManifest(input) {
   if (input !== null && typeof input === "object") return input;
   if (typeof input !== "string") throw new Error("Manifest must be a string or object.");
-
-  // Try JSON first (JSON is a subset of YAML, but JSON.parse is faster and stricter)
   try { return JSON.parse(input); } catch {}
-
-  // Try YAML
   if (yaml) {
     try {
       const parsed = yaml.load(input);
@@ -76,22 +226,17 @@ function parseManifest(input) {
       throw new Error(`YAML parse error: ${e.message}`);
     }
   }
-
   throw new Error("Could not parse input as JSON or YAML. Install js-yaml for YAML support.");
 }
 
-/**
- * Wrap a parsed Kubernetes manifest in an AdmissionReview envelope.
- */
 function buildAdmissionReview(parsedManifest) {
   const apiVersion = parsedManifest.apiVersion || "v1";
-  const hasGroup = apiVersion.includes("/");
-
+  const hasGroup   = apiVersion.includes("/");
   return {
     apiVersion: "admission.k8s.io/v1",
     kind: "AdmissionReview",
     request: {
-      uid: `test-${Date.now()}`,
+      uid:    `test-${Date.now()}`,
       kind: {
         group:   hasGroup ? apiVersion.split("/")[0] : "",
         version: hasGroup ? apiVersion.split("/")[1] : apiVersion,
@@ -114,15 +259,12 @@ function buildAdmissionReview(parsedManifest) {
   };
 }
 
-/**
- * POST an AdmissionReview to Gatekeeper and return the structured result.
- */
 function forwardToGatekeeper(admissionReview, targetUrl, ignoreTls) {
   return new Promise((resolve, reject) => {
-    const parsedUrl = new URL(targetUrl);
-    const isHttps = parsedUrl.protocol === "https:";
+    const parsedUrl         = new URL(targetUrl);
+    const isHttps           = parsedUrl.protocol === "https:";
     const effectiveIgnoreTls = ignoreTls !== undefined ? ignoreTls : IGNORE_TLS;
-    const reqBody = JSON.stringify(admissionReview);
+    const reqBody           = JSON.stringify(admissionReview);
 
     const options = {
       hostname: parsedUrl.hostname,
@@ -138,7 +280,7 @@ function forwardToGatekeeper(admissionReview, targetUrl, ignoreTls) {
       ...(TLS_CA ? { ca: TLS_CA } : {}),
     };
 
-    const lib = isHttps ? https : http;
+    const lib      = isHttps ? https : http;
     const proxyReq = lib.request(options, (proxyRes) => {
       let data = "";
       proxyRes.on("data", chunk => data += chunk);
@@ -158,10 +300,7 @@ function forwardToGatekeeper(admissionReview, targetUrl, ignoreTls) {
       });
     });
 
-    proxyReq.on("error", (err) => {
-      reject({ type: "network_error", message: err.message });
-    });
-
+    proxyReq.on("error", (err) => reject({ type: "network_error", message: err.message }));
     proxyReq.write(reqBody);
     proxyReq.end();
   });
@@ -169,40 +308,26 @@ function forwardToGatekeeper(admissionReview, targetUrl, ignoreTls) {
 
 // ── Route handlers ────────────────────────────────────────────────────────────
 
-/**
- * POST /validate
- *
- * Body (JSON):
- *   { manifest: <string|object>,       // YAML or JSON k8s manifest  — OR —
- *     admissionRequest: <object>,      // complete AdmissionReview envelope
- *     gatekeeperUrl?: string,
- *     ignoreTls?: boolean }
- */
 async function handleValidate(req, res) {
   let body;
   try { body = await readBody(req); } catch {
     return sendJson(res, 400, { error: "Failed to read request body." });
   }
-
   let parsed;
   try { parsed = JSON.parse(body); } catch {
     return sendJson(res, 400, { error: "Request body must be valid JSON." });
   }
 
   const { manifest, admissionRequest, gatekeeperUrl, ignoreTls } = parsed;
-
   if (!manifest && !admissionRequest) {
     return sendJson(res, 400, { error: "Provide either 'manifest' or 'admissionRequest'." });
   }
 
   let admissionReview;
-
   if (admissionRequest) {
-    // Full AdmissionReview supplied — use it directly, stamping a UID if absent.
     try {
       admissionReview = typeof admissionRequest === "string"
-        ? JSON.parse(admissionRequest)
-        : admissionRequest;
+        ? JSON.parse(admissionRequest) : admissionRequest;
     } catch {
       return sendJson(res, 400, { error: "Invalid JSON in 'admissionRequest'." });
     }
@@ -213,7 +338,6 @@ async function handleValidate(req, res) {
       };
     }
   } else {
-    // Manifest supplied — parse YAML/JSON and wrap in an AdmissionReview.
     let parsedManifest;
     try {
       parsedManifest = parseManifest(manifest);
@@ -224,63 +348,38 @@ async function handleValidate(req, res) {
   }
 
   const targetUrl = gatekeeperUrl || GATEKEEPER_URL;
-
   try {
     const result = await forwardToGatekeeper(admissionReview, targetUrl, ignoreTls);
     res.writeHead(result.status, { "Content-Type": "application/json" });
     res.end(JSON.stringify(result));
   } catch (err) {
-    if (err.type === "parse_error") {
-      return sendJson(res, 500, { error: "Non-JSON response from Gatekeeper.", raw: err.raw });
-    }
+    if (err.type === "parse_error") return sendJson(res, 500, { error: "Non-JSON response from Gatekeeper.", raw: err.raw });
     return sendJson(res, 502, { error: `Failed to reach Gatekeeper: ${err.message}` });
   }
 }
 
-/**
- * POST /validate/batch
- *
- * Send multiple manifests or full admission requests to Gatekeeper in one call.
- * Requests are forwarded concurrently; results are returned in the same order.
- *
- * Body (JSON):
- *   { manifests?:          Array<string|object>,   // YAML/JSON k8s manifests
- *     admissionRequests?:  Array<object>,           // complete AdmissionReview envelopes
- *     gatekeeperUrl?:      string,
- *     ignoreTls?:          boolean }
- *
- * Response: Array of result objects, each containing an `index` and `type` field
- * plus the same fields returned by /validate (or an `error` field on failure).
- */
 async function handleBatch(req, res) {
   let body;
   try { body = await readBody(req); } catch {
     return sendJson(res, 400, { error: "Failed to read request body." });
   }
-
   let parsed;
   try { parsed = JSON.parse(body); } catch {
     return sendJson(res, 400, { error: "Request body must be valid JSON." });
   }
 
   const { manifests, admissionRequests, gatekeeperUrl, ignoreTls } = parsed;
-
   if (!manifests?.length && !admissionRequests?.length) {
-    return sendJson(res, 400, {
-      error: "Provide a non-empty 'manifests' or 'admissionRequests' array.",
-    });
+    return sendJson(res, 400, { error: "Provide a non-empty 'manifests' or 'admissionRequests' array." });
   }
 
   const targetUrl = gatekeeperUrl || GATEKEEPER_URL;
-
-  // Build the list of work items (each becomes one request to Gatekeeper).
   const items = [];
 
   if (manifests?.length) {
     for (let i = 0; i < manifests.length; i++) {
       try {
-        const parsedManifest = parseManifest(manifests[i]);
-        items.push({ index: i, type: "manifest", review: buildAdmissionReview(parsedManifest) });
+        items.push({ index: i, type: "manifest", review: buildAdmissionReview(parseManifest(manifests[i])) });
       } catch (e) {
         items.push({ index: i, type: "manifest", parseError: e.message });
       }
@@ -291,11 +390,8 @@ async function handleBatch(req, res) {
     for (let i = 0; i < admissionRequests.length; i++) {
       try {
         let ar = typeof admissionRequests[i] === "string"
-          ? JSON.parse(admissionRequests[i])
-          : admissionRequests[i];
-        if (!ar?.request?.uid) {
-          ar = { ...ar, request: { ...ar.request, uid: `test-${Date.now()}-${i}` } };
-        }
+          ? JSON.parse(admissionRequests[i]) : admissionRequests[i];
+        if (!ar?.request?.uid) ar = { ...ar, request: { ...ar.request, uid: `test-${Date.now()}-${i}` } };
         items.push({ index: i, type: "admissionRequest", review: ar });
       } catch (e) {
         items.push({ index: i, type: "admissionRequest", parseError: e.message });
@@ -303,18 +399,13 @@ async function handleBatch(req, res) {
     }
   }
 
-  // Send all to Gatekeeper concurrently.
   const results = await Promise.all(items.map(async (item) => {
-    if (item.parseError) {
-      return { index: item.index, type: item.type, error: `Parse error: ${item.parseError}` };
-    }
+    if (item.parseError) return { index: item.index, type: item.type, error: `Parse error: ${item.parseError}` };
     try {
       const result = await forwardToGatekeeper(item.review, targetUrl, ignoreTls);
       return { index: item.index, type: item.type, ...result };
     } catch (err) {
-      if (err.type === "parse_error") {
-        return { index: item.index, type: item.type, error: "Non-JSON response from Gatekeeper.", raw: err.raw };
-      }
+      if (err.type === "parse_error") return { index: item.index, type: item.type, error: "Non-JSON response from Gatekeeper.", raw: err.raw };
       return { index: item.index, type: item.type, error: `Failed to reach Gatekeeper: ${err.message}` };
     }
   }));
@@ -322,7 +413,137 @@ async function handleBatch(req, res) {
   sendJson(res, 200, results);
 }
 
-// ── Server ────────────────────────────────────────────────────────────────────
+// ── Capture API handlers ───────────────────────────────────────────────────────
+
+/**
+ * POST /capture/start
+ * Body: { operations?: string[], resources?: string[], namespaces?: string[] }
+ *
+ * Creates (or replaces) the ValidatingWebhookConfiguration in the cluster so the
+ * kube-apiserver forwards real AdmissionReview objects to this pod's HTTPS server.
+ */
+async function handleCaptureStart(req, res) {
+  if (!capturePems || !captureServerStarted) {
+    return sendJson(res, 503, { error: "Capture HTTPS server is not running (selfsigned package missing or port conflict)." });
+  }
+  if (!CAPTURE_CA_BUNDLE) {
+    return sendJson(res, 503, { error: "TLS cert was not generated. Capture is unavailable." });
+  }
+  if (!isInCluster()) {
+    return sendJson(res, 400, {
+      error: "Not running in-cluster. Cannot auto-register the ValidatingWebhookConfiguration. " +
+             "Use GET /capture/status to obtain the caBundle and apply the VWC manually.",
+      caBundle: CAPTURE_CA_BUNDLE,
+      certSan:  CAPTURE_SAN,
+      capturePort: CAPTURE_PORT,
+    });
+  }
+
+  let body;
+  try { body = await readBody(req); } catch { body = "{}"; }
+  let config = {};
+  try { config = JSON.parse(body); } catch {}
+
+  // Normalise: split comma-separated strings into arrays
+  if (typeof config.namespaces === "string") config.namespaces = config.namespaces.split(",").map(s => s.trim()).filter(Boolean);
+  if (typeof config.operations === "string") config.operations = config.operations.split(",").map(s => s.trim()).filter(Boolean);
+  if (typeof config.resources  === "string") config.resources  = config.resources.split(",").map(s => s.trim()).filter(Boolean);
+
+  const vwc = buildVWC(config);
+  const client = getAdmissionClient();
+
+  try {
+    await client.createValidatingWebhookConfiguration(vwc);
+  } catch (e) {
+    const statusCode = e.response?.statusCode ?? e.statusCode;
+    if (statusCode === 409) {
+      // VWC already exists — replace it (updates caBundle with freshly generated cert)
+      try {
+        await client.replaceValidatingWebhookConfiguration(VWC_NAME, vwc);
+      } catch (e2) {
+        return sendJson(res, 500, { error: `Failed to replace VWC: ${e2.message}` });
+      }
+    } else {
+      return sendJson(res, 500, { error: `Failed to create VWC: ${e.message}` });
+    }
+  }
+
+  captureActive = true;
+  captureConfig = config;
+
+  sendJson(res, 200, {
+    active:      true,
+    vwcName:     VWC_NAME,
+    certSan:     CAPTURE_SAN,
+    capturePort: CAPTURE_PORT,
+    config,
+  });
+}
+
+/**
+ * POST /capture/stop
+ * Deletes the ValidatingWebhookConfiguration and stops storing new captures.
+ */
+async function handleCaptureStop(req, res) {
+  captureActive = false;
+
+  if (!isInCluster() || !k8s) {
+    return sendJson(res, 200, { active: false, note: "Not in-cluster — no VWC to delete." });
+  }
+
+  const client = getAdmissionClient();
+  try {
+    await client.deleteValidatingWebhookConfiguration(VWC_NAME);
+  } catch (e) {
+    const statusCode = e.response?.statusCode ?? e.statusCode;
+    if (statusCode !== 404) {
+      return sendJson(res, 500, { error: `Failed to delete VWC: ${e.message}` });
+    }
+    // 404 means it was already gone — that's fine
+  }
+
+  sendJson(res, 200, { active: false, vwcName: VWC_NAME });
+}
+
+/**
+ * GET /capture/status
+ */
+function handleCaptureStatus(req, res) {
+  sendJson(res, 200, {
+    active:               captureActive,
+    certSan:              CAPTURE_SAN,
+    capturePort:          CAPTURE_PORT,
+    captureServerStarted,
+    caBundle:             CAPTURE_CA_BUNDLE,
+    vwcName:              VWC_NAME,
+    requestCount:         capturedRequests.length,
+    config:               captureConfig,
+    inCluster:            isInCluster(),
+    k8sClientAvailable:   !!k8s,
+    certAvailable:        !!capturePems,
+  });
+}
+
+/**
+ * GET /captured?limit=N
+ * Returns the ring buffer of captured AdmissionReview objects (newest first).
+ */
+function handleGetCaptured(req, res) {
+  const { query } = url.parse(req.url, true);
+  const limit = query.limit ? parseInt(query.limit) : capturedRequests.length;
+  sendJson(res, 200, capturedRequests.slice(0, limit));
+}
+
+/**
+ * DELETE /captured
+ * Clears the ring buffer.
+ */
+function handleDeleteCaptured(req, res) {
+  capturedRequests = [];
+  sendJson(res, 200, { cleared: true });
+}
+
+// ── HTTP server ───────────────────────────────────────────────────────────────
 
 const server = http.createServer(async (req, res) => {
   const { pathname } = url.parse(req.url);
@@ -331,13 +552,16 @@ const server = http.createServer(async (req, res) => {
     return sendJson(res, 200, { status: "ok" });
   }
 
-  if (pathname === "/validate/batch" && req.method === "POST") {
-    return handleBatch(req, res);
-  }
+  // Capture API
+  if (pathname === "/capture/start"  && req.method === "POST")   return handleCaptureStart(req, res);
+  if (pathname === "/capture/stop"   && req.method === "POST")   return handleCaptureStop(req, res);
+  if (pathname === "/capture/status" && req.method === "GET")    return handleCaptureStatus(req, res);
+  if (pathname === "/captured"       && req.method === "GET")    return handleGetCaptured(req, res);
+  if (pathname === "/captured"       && req.method === "DELETE") return handleDeleteCaptured(req, res);
 
-  if (pathname === "/validate" && req.method === "POST") {
-    return handleValidate(req, res);
-  }
+  // Validation API
+  if (pathname === "/validate/batch" && req.method === "POST") return handleBatch(req, res);
+  if (pathname === "/validate"       && req.method === "POST") return handleValidate(req, res);
 
   serveStatic(req, res);
 });
