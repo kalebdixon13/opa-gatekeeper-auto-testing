@@ -154,7 +154,7 @@ async function removeVWC(name) {
 
 // ── Environment ───────────────────────────────────────────────────────────────
 
-const GATEKEEPER_URL  = process.env.GATEKEEPER_URL || "https://gatekeeper-webhook.gatekeeper-system.svc:8443/v1/admit";
+const GATEKEEPER_URL  = process.env.GATEKEEPER_URL || "https://gatekeeper-webhook-service.gatekeeper-system.svc/v1/admit";
 const IGNORE_TLS      = process.env.IGNORE_TLS === "true";
 const PORT            = parseInt(process.env.PORT)         || 3000;
 const CAPTURE_PORT    = parseInt(process.env.CAPTURE_PORT) || 8443;

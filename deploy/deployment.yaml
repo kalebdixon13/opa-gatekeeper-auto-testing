@@ -35,7 +35,7 @@ spec:
               value: "gatekeeper-tester"
             # Gatekeeper webhook URL (adjust if different)
             - name: GATEKEEPER_URL
-              value: "https://gatekeeper-webhook-service.gatekeeper-system.svc:8443/v1/admit"
+              value: "https://gatekeeper-webhook-service.gatekeeper-system.svc/v1/admit"
             - name: IGNORE_TLS
               value: "true"
             # Optional: increase capture ring buffer size
